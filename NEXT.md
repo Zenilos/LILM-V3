@@ -51,14 +51,18 @@ against which everything else is compared.
     --warmup 2000 \
     --sample-prob 0.0 \
     --teacher none \
-    --max-len 256
+    --max-len 256 \
+    --fp
 ```
 
 **Why this is the right command:**
-- `--ramp-frac 0.2`: quantizer ramps in over the first 4000 steps. In fp mode
-  the ramp doesn't matter (ramp only affects ternary weights, which are just
-  regular weights in fp), but this keeps the config canonical so the fp and QAT
-  runs are identical except for `--ramp-frac`.
+- `--fp`: forces the ramp `t` to 0 for both training AND greedy decode. There
+  is no separate fp flag in the code — quantization strength is the ramp value
+  `t` (0 = latent fp, 1 = fully ternary), and `greedy_decode` otherwise decodes
+  at `t=1.0`, which would snap the latent fp weights to ternary {-1,0,+1}.
+  `--fp` makes this a clean, unquantized capacity/exposure-bias baseline.
+- `--ramp-frac 0.2`: kept so the config stays canonical for later QAT runs,
+  but it is inert while `--fp` is on.
 - `--warmup 2000`: 2000-step warmup, then cosine decay over 18k steps. This is
   the schedule the paper specifies. The old fp_ab.log never left warmup.
 - `--sample-prob 0.0`: no scheduled sampling yet — this isolates the baseline
@@ -83,7 +87,8 @@ strongest, `triple` weakest). Also watch whether EM peaks mid-run then declines
 
 ## Step 2 — fp + scheduled sampling (if Step 1 EM < 0.10)
 
-If exposure bias is still dominant, rerun with `--sample-prob 0.1`:
+If exposure bias is still dominant, rerun with `--sample-prob 0.1` (keep
+`--fp` for a clean fp comparison):
 
 ```bash
 ~/p3.11/bin/python3 train_student.py \

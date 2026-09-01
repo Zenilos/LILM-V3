@@ -320,7 +320,7 @@ def kl_temperature(logits_s: mx.array, logits_t: mx.array,
 # Evaluation
 # --------------------------------------------------------------------------
 def greedy_decode(model, utt_words: list[str], utt_ids: list[int],
-                  vocab: Vocab, fsm: FSM):
+                  vocab: Vocab, fsm: FSM, t: float = 1.0):
     n = len(utt_ids)
     inp = mx.array(utt_ids, dtype=mx.int32)[None, :]
     st = fsm.start(n)
@@ -329,7 +329,7 @@ def greedy_decode(model, utt_words: list[str], utt_ids: list[int],
         legal = fsm.legal(st)
         if not legal:
             break
-        logits = model(inp, 1.0)[0, -1, :]
+        logits = model(inp, t)[0, -1, :]
         la = mx.array(sorted(legal), dtype=mx.int32)
         sel = mx.take(logits, la)
         tid = int(la[mx.argmax(sel)].item())
@@ -351,13 +351,13 @@ def greedy_decode(model, utt_words: list[str], utt_ids: list[int],
         return None
 
 
-def evaluate(model, val_items, vocab, fsm, n_eval=512):
+def evaluate(model, val_items, vocab, fsm, n_eval=512, t: float = 1.0):
     correct = total = 0
     order = list(range(len(val_items)))
     random.Random(0).shuffle(order)
     for i in order[:n_eval]:
         uid, words, _, _, gold = val_items[i]
-        pred = greedy_decode(model, words, uid, vocab, fsm)
+        pred = greedy_decode(model, words, uid, vocab, fsm, t=t)
         total += 1
         if pred is not None and actions_match(pred, gold):
             correct += 1
@@ -427,6 +427,9 @@ def parse_args():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--ramp-frac", type=float, default=RAMP_FRAC)
     ap.add_argument("--warmup", type=int, default=WARMUP)
+    ap.add_argument("--fp", action="store_true",
+                    help="pure fp baseline: force ramp to 0 for training AND "
+                         "decode (no ternary snapping) regardless of --ramp-frac")
     return ap.parse_args()
 
 
@@ -514,6 +517,8 @@ def main():
                 labels[r, start - 1: start - 1 + ln] = mx.array(lab, dtype=mx.int32)
 
             ramp = min(1.0, step / ramp_steps)
+            if a.fp:
+                ramp = 0.0
             # scheduled sampling
             sampled = None
             sample_p = a.sample_prob * min(1.0, step / max(1, int(a.steps * 0.5)))
@@ -550,7 +555,8 @@ def main():
                       f"ramp={ramp:.2f} lr={lr:.2e} "
                       f"{time.time()-t0:.0f}s", flush=True)
             if a.eval_every and step % a.eval_every == 0:
-                em = evaluate(model, val_items, vocab, fsm)
+                em = evaluate(model, val_items, vocab, fsm,
+                              t=0.0 if a.fp else 1.0)
                 print(f"  [eval step {step}] val_em={em:.4f}", flush=True)
                 os.makedirs(a.out, exist_ok=True)
                 if em >= best_em:
