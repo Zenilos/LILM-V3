@@ -75,7 +75,7 @@ def load_model(path):
     return model
 
 
-def greedy_decode(model, utt_ids, vocab, fsm):
+def greedy_decode(model, utt_words, utt_ids, vocab, fsm):
     n = len(utt_ids)
     inp = mx.array(utt_ids, dtype=mx.int32)[None, :]
     st = fsm.start(n)
@@ -101,7 +101,7 @@ def greedy_decode(model, utt_ids, vocab, fsm):
     try:
         if gen[0] == vocab.id["<no>"]:
             return [Action("UNAVAILABLE", {})]
-        return decode(" ".join(["x"] * n), [vocab.id["<plan>"]] + gen, vocab)
+        return decode(" ".join(utt_words), [vocab.id["<plan>"]] + gen, vocab)
     except Exception:
         return None
 
@@ -128,9 +128,10 @@ def run_eval(model, rows, vocab, fsm, bt):
         acts = r["_acts"]
         rejected = acts[0].intent == "UNAVAILABLE"
         kind = "reject" if rejected else {1: "atomic", 2: "pair", 3: "triple"}[len(acts)]
-        uid = bt.ids(tokenize(r["text"]))
+        words = tokenize(r["text"])
+        uid = bt.ids(words)
         try:
-            pred = greedy_decode(model, uid, vocab, fsm)
+            pred = greedy_decode(model, words, uid, vocab, fsm)
         except Exception:
             pred = None
         total += 1
@@ -174,11 +175,11 @@ def run_eval(model, rows, vocab, fsm, bt):
             intent_ok += 1
         by_kind_n[kind] = by_kind_n.get(kind, 0) + 1
 
-    intent_denom = max(1, total - ok_fp)  # reject rows not intent-scorable... approx
+    intent_denom = max(1, ok_tp + ok_fn)
     return {
         "em": em / max(1, total),
         "n": total,
-        "intent_acc": intent_ok / max(1, total),
+        "intent_acc": intent_ok / intent_denom,
         "slot_precision": slot_tp / max(1, slot_tp + slot_fp),
         "slot_recall": slot_tp / max(1, slot_tp + slot_fn),
         "pers_precision": pers_tp / max(1, pers_tp + pers_fp),

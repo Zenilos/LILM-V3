@@ -124,7 +124,8 @@ def main():
     ap.add_argument("--temp", type=float, default=0.9)
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args()
-    rows = [json.loads(l) for l in open(a.inp)]
+    with open(a.inp) as f:
+        rows = [json.loads(l) for l in f]
     if a.limit:
         rows = rows[:a.limit]
     with open(a.out, "w") as f:

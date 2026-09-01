@@ -39,7 +39,7 @@ POOLS = {
             "the study", "the playroom", "the den", "the closet", "the foyer",
             "the terrace", "the guest room", "the cellar", "the rooftop", "the porch",
             "the library", "the gym", "the driveway", "the courtyard", "the corridor",
-            "the mudroom", "the utility room", "the greenhouse", "the sauna", "the cellar",
+            "the mudroom", "the utility room", "the greenhouse", "the sauna",
         ],
         "val": [
             "the conservatory", "the mezzanine", "the storeroom", "the veranda",
@@ -65,7 +65,7 @@ POOLS = {
             "the cup", "the red ball", "my keys", "the remote", "the plant",
             "my phone", "the towel", "the blue box", "my glasses", "the newspaper",
             "the scissors", "the book", "the pillow", "the mug", "the charger",
-            "the hat", "the scarf", "the umbrella", "the umbrella", "the water bottle",
+            "the hat", "the scarf", "the umbrella", "the water bottle",
             "my wallet", "the tablet", "the speaker", "the chess set", "the candle",
         ],
         "val": [

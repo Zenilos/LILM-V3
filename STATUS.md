@@ -12,19 +12,20 @@ the concrete next steps. It is the working record for the solo session; see
 
 The **full student-training pipeline is built and runs end-to-end**, but does
 **not yet produce a model with meaningful exact-match (EM) on the validation
-set**. We found the precise failure mode via an fp-vs-QAT ablation; we have not
-yet fixed it. Nothing is currently training.
+set**. We found the precise failure mode via an fp-vs-QAT ablation and have
+landed the fixes (corrected EM harness, schedule-sampled training, optional KD);
+the re-validation run has **not** been done yet. Nothing is currently training.
 
 | Component | Status |
 |---|---|
 | Data generation (`corpus.py`) | Done. `data/train_a.jsonl` (470,113 unique) + `data/val.jsonl` (3,641 unique). 55/28/9/8 mix. |
 | DSL + wire serialization (`dsl.py`, `serialize.py`) | Done, unit-verified (vocab=4388). |
-| Student model (`model.py`) | Done. 11,135,360 params, tied embed/LM-head, GQA, SwiGLU, RoPE. |
-| QAT training (`train_student.py`) | Runs; **failure mode identified** (below). |
-| Eval harness (`eval.py`) | Done; loader fixed (unflattens dot-key `.npz`, `model.update`). |
+| Student model (`train_student.py`; `model.py` trimmed to shared `ModelConfig`) | Done. 11.1M params, tied embed/LM-head, GQA, SwiGLU, RoPE. |
+| QAT training (`train_student.py`) | Runs; failure identified (below) with fixes landed (pointer-decode metric bug, gold alignment, scheduled sampling, KD). Re-validation run pending. |
+| Eval harness (`eval.py`) | Done; loader fixed (unflattens dot-key `.npz`, `model.update`); pointer decode + intent-denominator fixed. |
 | Export (`export.py`) | 3.63 MB blob verified on a checkpoint. |
 | FSM in C (`fsm.h`, `fsm.c`) | Done; self-test passes (vocab=4388, mask=549B). |
-| Teacher fine-tune (`train_teacher.py`) | Written, **not run** (needs BPE-aware encode + HF stack). |
+| Teacher fine-tune (`train_teacher.py`) | Written, **not run** (needs BPE-aware encode + HF stack); student KD logit-distillation is implemented and gated on `--teacher`. |
 | Paraphrase (`paraphrase.py`) | Written; **blocked** (Ollama not reachable on :11434). |
 
 ---
@@ -45,6 +46,36 @@ yet fixed it. Nothing is currently training.
 
 4. `eval.py` checkpoint loading was broken (used `model.load` with flat keys).
    Fixed with dot-key unflatten + `model.update`. Verified.
+
+5. **Pointer decode scored against fake input text (metric artifact).**
+   `greedy_decode` decoded generated pointer tokens against `" ".join(["x"]*n)`
+   instead of the real utterance, so every copy-pointer slot decoded to `"x..."`
+   and could never match gold — the near-zero val EM was partly a *measurement*
+   artifact, not pure model failure. Fixed in `train_student.py` and `eval.py`:
+   decode against the real utterance words.
+
+6. **Val golds / items misalignment.** `encode_rows` drops the occasional row,
+   but `val_golds` was a blind truncation of `val_rows._acts`, so `evaluate`
+   could match predictions to the wrong gold plans. `encode_rows` now carries
+   `(uid, words, label, start, gold)` per item and `evaluate` scores each item
+   against its own gold.
+
+7. **RoPE buffer vs `--max-len` mismatch.** `ModelConfig.context_length=128`
+   preallocated the RoPE tables while training defaulted to `--max-len 256` — a
+   latent reshape crash on sequences >128. `context_length` is now 256.
+
+8. **Dead duplicate architecture removed.** `model.py` reimplemented the student
+   with different module names (`q_proj` vs `q`, etc.), so its `StudentModel`
+   could never load a training checkpoint. `model.py` is trimmed to the shared
+   `ModelConfig`; `train_student.py` is the single canonical architecture.
+
+9. **Tokenizer-prune ID promise made explicit.** `build_pruned_tokenizer`
+   renamed kept tokens by enumeration; changed to `{t: vocab[t]}` so original
+   SmolLM2 IDs are preserved by contract (the KD `gather` premise).
+
+10. Housekeeping: `torch.load(..., weights_only=True)`; duplicate pool entries
+    in `corpus.py`; dead `intent_denom` and wrong intent denominator in
+    `eval.py`; open file handle in `paraphrase.py`. All fixed.
 
 ---
 
@@ -71,6 +102,12 @@ utterance*. In deployment (free-run), once one token is slightly off the
 label-pattern autoregression cascades → wrong intents/slots → ~0 EM, even on
 training data.
 
+**Measurement caveat:** until fix #5 above, the val EM figure was itself
+depressed by the pointer-decode artifact. The exposure-bias diagnosis — train
+teacher-forced ≈ 0.005 with free-run intents 2/30 — is unaffected (free-run
+intent counts don't depend on decoding pointers), but the fp ablation must be
+re-run on the fixed harness to get a true EM number.
+
 Secondary contributor: the val split is deliberately out-of-distribution
 (held-out entities), but that is not the primary cause — train free-run is also
 bad.
@@ -82,11 +119,12 @@ consistent with this, not an independent quantization failure.
 
 ## Next steps (in order of leverage)
 
-1. **Fix exposure bias — implement scheduled sampling** in `train_student.py`:
-   during training, with probability `eps` decaying over the run, feed the
-   model its *own* previously sampled token instead of the gold token at each
-   label position. This directly addresses the confirmed failure mode. Simple,
-   contained change (~20 lines).
+1. **Scheduled sampling — implemented, needs a validation run.** Live as
+   `--sample-prob` (default 0). At each label position the model's own greedy
+   argmax is fed back as input instead of the gold token, with per-token
+   probability `eps(t)` ramping in over the first half of the run; loss labels
+   stay gold. Re-run the fp ablation (`--ramp-frac 100 --warmup 3000 --steps
+   3000`) on the fixed harness to confirm:
    - Success criterion: fp train free-run intents-only accuracy jumps sharply
      (>> 2/30), and fp val EM climbs well above 0.023.
 

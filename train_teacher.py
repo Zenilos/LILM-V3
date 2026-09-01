@@ -112,7 +112,7 @@ def build_pruned_tokenizer(
     vocab = bpe.get_vocab()
     ordered = sorted(vocab.items(), key=lambda kv: kv[1])
     kept_tokens = [t for t, _ in ordered[:keep]]
-    new_vocab = {t: i for i, t in enumerate(kept_tokens)}
+    new_vocab = {t: vocab[t] for t in kept_tokens}
 
     # `merges` is a list of (left, right) pairs in most tokenizers builds, but
     # some ship it as a dict of "left right" -> rank. Normalize both to pairs.
@@ -465,7 +465,7 @@ def main():
     global_step = 0
     best_em = 0.0
     if args.resume and os.path.exists(last_pt):
-        ck = torch.load(last_pt, map_location=device)
+        ck = torch.load(last_pt, map_location=device, weights_only=True)
         model.load_state_dict(ck["model"])
         optimizer.load_state_dict(ck["optimizer"])
         scheduler.load_state_dict(ck["scheduler"])

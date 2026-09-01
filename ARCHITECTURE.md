@@ -15,7 +15,7 @@ Decoder-only, same family as v0 so the existing kernels carry over.
 | heads | 6 query / 2 KV (GQA) , head_dim 64 | KV cache is 1/3 of MHA |
 | FFN | SwiGLU, hidden 1024 | |
 | Norm / pos | RMSNorm / RoPE | |
-| Context | **128**, down from 512 | longest generated utterance is 33 tokens; quarters prefill cost and KV |
+| Context | **256** | matches training `--max-len 256`; wire format needs ≤128 input tokens + up to 18 label tokens, so the prefill window has headroom. On-device KV is still a tunable budget (see §1 memory map). |
 | Vocab | 4388 = 4096 pruned BPE + 292 special | |
 | Params | 9.44M ternary linears + 1.69M embedding = **11.1M** | |
 
@@ -45,7 +45,7 @@ sense when I thought flash was the tight resource.
 Memory map:
 
 - PSRAM: weights 3.6 MB, working buffers ~0.5 MB
-- Internal SRAM: KV cache 192 KB (6 × 128 × 2 heads × 64 × 2 tensors, int8) + activations
+- Internal SRAM: KV cache 384 KB (6 × 256 × 2 heads × 64 × 2 tensors, int8) + activations
 - Flash: weight partition (OTA-able independently of firmware) + tokenizer ~200 KB
 
 Worst case output is **18 tokens** (`serialize.budget()`), typical 8–9. At 30
@@ -147,12 +147,21 @@ to both teacher and student logits before the softmax** in the KL term, so
 capacity goes into the decisions that are actually live rather than into
 learning to suppress tokens the decoder already forbids.
 
+**Implemented so far:** the β·KL term is live in `train_student.py` under
+`--teacher <path>` (temp-scaled, masked to supervised positions, lazy torch
+import, graceful no-teacher fallback). The γ hidden-state term is **deferred**:
+hidden-position alignment is ill-defined because the student is word-level
+(`serialize.tokenize`) while the teacher is BPE-level, so there is no stable
+`h_t` position to supervise. Revisit only if logit-level KD proves
+insufficient.
+
 AdamW, lr 3e-3 (ternary tolerates higher than fp), cosine schedule, 2k warmup,
 wd 0.1 off norms and embeddings, batch 256 sequences.
 
 **Ablations worth running**, because each one is complexity that has to earn
-its place: KD vs hard-label only; pointer vs generated values; context 128 vs
-256; FSM-masked KL vs plain KL; with and without the hidden-state term.
+its place: KD vs hard-label only; pointer vs generated values; on-device
+context 128 vs 256 (KV budget); FSM-masked KL vs plain KL; with and without the
+hidden-state term.
 
 ## 5. Evaluation
 

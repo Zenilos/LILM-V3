@@ -95,7 +95,7 @@ gradient_accumulation: 8
 | FFN | SwiGLU, hidden 1024 |
 | Norm | RMSNorm |
 | Pos | RoPE |
-| Context | 128 |
+| Context | 256 |
 | Vocab | 4388 (4096 BPE + 292 special) |
 | Params | 11.1M (9.44M ternary + 1.69M embedding) |
 
@@ -138,7 +138,7 @@ batch_size: 256
 |----------|---------|
 | KD vs hard-label only | Is distillation worth the complexity? |
 | Pointer vs generated values | Do copy pointers help generalization? |
-| Context 128 vs 256 | Is 128 sufficient? |
+| Context 128 vs 256 | Is 256 the right on-device KV budget? |
 | FSM-masked KL vs plain KL | Does masking help capacity allocation? |
 | With/without hidden-state term | Is the projection loss useful? |
 

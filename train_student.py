@@ -13,6 +13,8 @@ Quantization (BitNet b1.58), every linear weight:
 Loss (only positions at/after the first label token, i.e. >= <plan>):
     L = alpha*CE(gold) + beta*KL(student||teacher,T) + gamma*||P h_s - h_t||^2
   With no teacher (--teacher none) only the CE term runs (ablation).
+  gamma*||P h_s - h_t||^2 is deferred (hidden-position alignment is ill-defined:
+  student is word-level, teacher is BPE-level).
 
 Base tokenizer: the pruned SmolLM2 BPE is not needed to *train* the student,
 which consumes a concrete per-corpus word->id map (serialize.tokenize) for the
@@ -270,7 +272,7 @@ def load_rows(path: str, limit: int = 0) -> list[dict]:
 
 
 def encode_rows(rows, vocab: Vocab, bt: BaseTok, max_len: int):
-    """Return list of (utt_ids, label_ids) and the label-start index each row."""
+    """Return list of (utt_ids, utt_words, label_ids, start, gold_actions)."""
     items = []
     for r in rows:
         try:
@@ -283,7 +285,7 @@ def encode_rows(rows, vocab: Vocab, bt: BaseTok, max_len: int):
         uid = bt.ids(utt)
         if len(uid) + len(label) > max_len:
             continue
-        items.append((uid, label, len(uid)))
+        items.append((uid, utt, label, len(uid), r["_acts"]))
     return items
 
 
@@ -303,10 +305,22 @@ def ce_loss(logits: mx.array, labels: mx.array) -> mx.array:
     return mx.sum(ce) / mx.maximum(mx.sum(valid), 1)
 
 
+def kl_temperature(logits_s: mx.array, logits_t: mx.array,
+                   temp: float, mask: mx.array) -> mx.array:
+    """KL(student || teacher) scaled by temp^2, masked to supervised positions."""
+    log_ps = nn.log_softmax(logits_s / temp, axis=-1)
+    log_pt = nn.log_softmax(logits_t / temp, axis=-1)
+    pt = mx.exp(log_pt)
+    kl = mx.sum(pt * (log_pt - log_ps), axis=-1)
+    kl = mx.where(mask, kl, 0.0)
+    return mx.sum(kl) / mx.maximum(mx.sum(mask.astype(kl.dtype)), 1) * (temp * temp)
+
+
 # --------------------------------------------------------------------------
 # Evaluation
 # --------------------------------------------------------------------------
-def greedy_decode(model, utt_ids: list[int], vocab: Vocab, fsm: FSM):
+def greedy_decode(model, utt_words: list[str], utt_ids: list[int],
+                  vocab: Vocab, fsm: FSM):
     n = len(utt_ids)
     inp = mx.array(utt_ids, dtype=mx.int32)[None, :]
     st = fsm.start(n)
@@ -332,22 +346,65 @@ def greedy_decode(model, utt_ids: list[int], vocab: Vocab, fsm: FSM):
     try:
         if gen[0] == vocab.id["<no>"]:
             return [Action("UNAVAILABLE", {})]
-        return decode(" ".join(["x"] * n), [vocab.id["<plan>"]] + gen, vocab)
+        return decode(" ".join(utt_words), [vocab.id["<plan>"]] + gen, vocab)
     except Exception:
         return None
 
 
-def evaluate(model, val_items, golds, vocab, fsm, n_eval=512):
+def evaluate(model, val_items, vocab, fsm, n_eval=512):
     correct = total = 0
     order = list(range(len(val_items)))
     random.Random(0).shuffle(order)
     for i in order[:n_eval]:
-        uid, _, _start = val_items[i]
-        pred = greedy_decode(model, uid, vocab, fsm)
+        uid, words, _, _, gold = val_items[i]
+        pred = greedy_decode(model, words, uid, vocab, fsm)
         total += 1
-        if pred is not None and actions_match(pred, golds[i]):
+        if pred is not None and actions_match(pred, gold):
             correct += 1
     return correct / max(1, total)
+
+
+# --------------------------------------------------------------------------
+# Teacher loader (lazy torch import)
+# --------------------------------------------------------------------------
+def _load_teacher(path: str, vocab_size: int):
+    import torch
+    import transformers
+    model = transformers.AutoModelForCausalLM.from_pretrained(
+        "HuggingFaceTB/SmolLM2-135M")
+    model.resize_token_embeddings(vocab_size)
+    ck = torch.load(path, map_location="cpu", weights_only=True)
+    model.load_state_dict(ck["model"])
+    model.eval()
+    return model
+
+
+def load_teacher(path: str, vocab_size: int):
+    """Try loading the teacher; on failure fall back to no-teacher."""
+    if path.lower() == "none":
+        return None
+    if not os.path.isfile(path):
+        print(f"WARNING: teacher checkpoint not found at {path}; "
+              "running without teacher.", flush=True)
+        return None
+    try:
+        t = _load_teacher(path, vocab_size)
+        print(f"teacher loaded from {path}", flush=True)
+        return t
+    except Exception as e:
+        print(f"WARNING: failed to load teacher ({e}); "
+              "running without teacher.", flush=True)
+        return None
+
+
+def teacher_logits(teacher, inputs: mx.array):
+    """Run teacher forward, return detached MLX logits."""
+    import torch
+    with torch.no_grad():
+        inp_t = torch.tensor(np.array(inputs), dtype=torch.long)
+        out = teacher(inp_t).logits.float()
+        out = out.detach().cpu().numpy()
+    return mx.array(out, dtype=mx.float32)
 
 
 # --------------------------------------------------------------------------
@@ -359,6 +416,8 @@ def parse_args():
     ap.add_argument("--val", default="data/val.jsonl")
     ap.add_argument("--out", default="checkpoints/student")
     ap.add_argument("--teacher", default="none")
+    ap.add_argument("--sample-prob", type=float, default=0.0,
+                    help="scheduled sampling probability (0 = disabled)")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--eval-every", type=int, default=2000)
@@ -389,12 +448,16 @@ def main():
 
     train_items = encode_rows(train_rows, vocab, bt, a.max_len)
     val_items = encode_rows(val_rows, vocab, bt, a.max_len)
-    val_golds = [r["_acts"] for r in val_rows][: len(val_items)]
     print(f"encodable: train={len(train_items)} val={len(val_items)}", flush=True)
 
     model = Student(cfg)
     num_params = _count_params(model.parameters())
     print(f"params: {num_params:,}", flush=True)
+
+    teacher = load_teacher(a.teacher, vocab.size)
+    # GAMMA (hidden-state KD projection) is deferred: hidden-position alignment
+    # is ill-defined because the student is word-level while the teacher is BPE-level.
+    amp = None
 
     def lr_schedule(t):
         if t < a.warmup:
@@ -404,16 +467,26 @@ def main():
 
     optimizer = optim.AdamW(learning_rate=a.lr, betas=(BETA1, BETA2),
                             eps=EPS, weight_decay=WD)
-    amp = None  # KD hidden projection when teacher is enabled
 
     ramp_steps = max(1, int(a.steps * a.ramp_frac))
     idx = list(range(len(train_items)))
     best_em, step, t0 = 0.0, 0, time.time()
 
-    def loss_fn(params, inputs, labels, ramp):
+    def loss_fn(params, inputs, labels, ramp,
+                sampled_inputs=None, t_logits=None):
         model.update(params)
-        logits = model(inputs, ramp)
-        return ALPHA * ce_loss(logits, labels)
+        use_sample = sampled_inputs is not None
+        if use_sample:
+            logits = model(sampled_inputs, ramp)
+        else:
+            logits = model(inputs, ramp)
+        loss = ALPHA * ce_loss(logits, labels)
+        if t_logits is not None:
+            mask = labels != NEG
+            if int(mx.sum(mask).item()) > 0:
+                kl = kl_temperature(logits, t_logits, TEMP, mask)
+                loss = loss + BETA * kl
+        return loss
 
     loss_and_grad = mx.value_and_grad(loss_fn, argnums=0)
 
@@ -424,14 +497,14 @@ def main():
             if step >= a.steps:
                 break
             batch_idx = idx[bi:bi + a.batch]
-            blen = max(len(train_items[i][0]) + len(train_items[i][1])
+            blen = max(len(train_items[i][0]) + len(train_items[i][2])
                        for i in batch_idx)
             blen = min(blen, a.max_len)
             n = len(batch_idx)
             inputs = mx.zeros((n, blen), dtype=mx.int32)
             labels = mx.full((n, blen), NEG, dtype=mx.int32)
             for r, i in enumerate(batch_idx):
-                uid, lab, start = train_items[i]
+                uid, _, lab, start, _ = train_items[i]
                 seq = (uid + lab)[:blen]
                 inputs[r, : len(seq)] = mx.array(seq, dtype=mx.int32)
                 ln = len(lab)
@@ -441,10 +514,34 @@ def main():
                 labels[r, start - 1: start - 1 + ln] = mx.array(lab, dtype=mx.int32)
 
             ramp = min(1.0, step / ramp_steps)
+            # scheduled sampling
+            sampled = None
+            sample_p = a.sample_prob * min(1.0, step / max(1, int(a.steps * 0.5)))
+            if a.sample_prob > 0 and sample_p > 0:
+                logits1 = model(inputs, ramp)
+                sampled_list = []
+                for r in range(n):
+                    uid_len = len(train_items[batch_idx[r]][0])
+                    ln = len(train_items[batch_idx[r]][2])
+                    argmax_tokens = mx.argmax(logits1[r], axis=-1)
+                    positions = mx.arange(blen)
+                    in_label = (positions >= uid_len) & (positions < uid_len + ln)
+                    do_sample = mx.array(
+                        [random.random() < sample_p for _ in range(blen)])
+                    mask = in_label & do_sample
+                    sampled_list.append(mx.where(mask, argmax_tokens, inputs[r]))
+                sampled = mx.stack(sampled_list)
+
+            # teacher logits
+            t_logits = None
+            if teacher is not None:
+                t_logits = teacher_logits(teacher, sampled if sampled is not None else inputs)
+
             lr = lr_schedule(step)
             optimizer.learning_rate = lr
             lossv, grads = loss_and_grad(
-                model.trainable_parameters(), inputs, labels, ramp)
+                model.trainable_parameters(), inputs, labels, ramp,
+                sampled_inputs=sampled, t_logits=t_logits)
             optimizer.update(model, grads)
             step += 1
 
@@ -453,7 +550,7 @@ def main():
                       f"ramp={ramp:.2f} lr={lr:.2e} "
                       f"{time.time()-t0:.0f}s", flush=True)
             if a.eval_every and step % a.eval_every == 0:
-                em = evaluate(model, val_items, val_golds, vocab, fsm)
+                em = evaluate(model, val_items, vocab, fsm)
                 print(f"  [eval step {step}] val_em={em:.4f}", flush=True)
                 os.makedirs(a.out, exist_ok=True)
                 if em >= best_em:
