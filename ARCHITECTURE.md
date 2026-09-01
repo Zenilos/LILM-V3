@@ -15,21 +15,25 @@ Decoder-only, same family as v0 so the existing kernels carry over.
 | heads | 6 query / 2 KV (GQA) , head_dim 64 | KV cache is 1/3 of MHA |
 | FFN | SwiGLU, hidden 1024 | |
 | Norm / pos | RMSNorm / RoPE | |
-| Context | **256** | matches training `--max-len 256`; wire format needs ≤128 input tokens + up to 18 label tokens, so the prefill window has headroom. On-device KV is still a tunable budget (see §1 memory map). |
+| Context (train) | **256** | training window (`--max-len 256`); gives the RoPE buffers headroom over the wire format's real needs |
+| Context (on-device) | **128** | `FSM_MAX_INPUT`/`serialize.MAX_INPUT_TOKENS` cap the input at 128; worst-case 33-token utterance + 18 output tokens fits with room. Sized so the KV cache stays in internal SRAM (below). |
 | Vocab | 4388 = 4096 pruned BPE + 292 special | |
 | Params | 9.44M ternary linears + 1.69M embedding = **11.1M** | |
 
 The 292 special tokens are 4 control, 7 intent, 25 literal, 256 pointer
 (`<s:0..127>`, `<e:0..127>`). Embedding is tied with the LM head.
 
-### Storage
+### Storage (measured)
+
+An actual `export.py` run on a trained checkpoint produced the ground-truth
+blob. `model.tern` = **3,632,692 bytes (3.63 MB)**:
 
 | | bytes |
 |---|---|
 | Linears, ternary packed 5 trits/byte (1.6 bit/weight) | 1.89 MB |
-| Embedding, int8 | 1.69 MB |
-| Per-output-channel fp16 scales + norms | ~40 KB |
-| **Total** | **~3.6 MB** |
+| Embedding, int8 | 1.68 MB |
+| Per-output-channel fp16 scales + norms | ~0.06 MB |
+| **Total (measured)** | **3.63 MB** |
 
 ### The binding constraint is memory bandwidth, not compute or flash
 
@@ -42,11 +46,17 @@ octal PSRAM at boot (~120 MB/s effective) gives ~30 ms/token.
 your 8 MB. This supersedes the mmap suggestion from earlier — it only made
 sense when I thought flash was the tight resource.
 
-Memory map:
+Memory map (ESP32-S3 N16R8: 16 MB flash, 8 MB octal PSRAM, ~327 KB usable
+internal SRAM):
 
-- PSRAM: weights 3.6 MB, working buffers ~0.5 MB
-- Internal SRAM: KV cache 384 KB (6 × 256 × 2 heads × 64 × 2 tensors, int8) + activations
-- Flash: weight partition (OTA-able independently of firmware) + tokenizer ~200 KB
+- PSRAM: weights 3.63 MB + working buffers ~1.0 MB ≈ **5.0 MB of 8 MB** (✔ ~3 MB headroom)
+- Internal SRAM: KV cache **192 KB** (6 × 128 × 2 heads × 64 × 2 tensors, int8)
+- Flash: weight partition 3.63 MB + tokenizer ~200 KB ≈ **5.3 MB of 16 MB** (✔ ample)
+
+KV cache sizing: at context 256 the KV cache would be 393 KB, which exceeds
+internal SRAM and would force PSRAM-KV (slower). At context 128 it is 192 KB
+and stays in internal SRAM. Since the wire format caps input at 128 and real
+utterances are ≤33 tokens, context 128 is the right on-device choice.
 
 Worst case output is **18 tokens** (`serialize.budget()`), typical 8–9. At 30
 ms/token that's ~0.3 s decode plus one prefill pass, so roughly **0.5 s

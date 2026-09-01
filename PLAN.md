@@ -177,16 +177,23 @@ fsm_state_t fsm_step(fsm_state_t state, int token);
 
 ## Phase 5: ESP32 Deployment
 
-### 5.1 Memory Map
+### 5.1 Memory Map (ESP32-S3 N16R8: 16 MB flash, 8 MB PSRAM)
+
+Measured weight blob = **3.63 MB** (`export.py`). Whole working set fits.
 
 | Region | Usage | Size |
 |--------|-------|------|
-| PSRAM | Weights | 3.6 MB |
-| PSRAM | Working buffers | ~0.5 MB |
-| Internal SRAM | KV cache (int8) | 192 KB |
+| PSRAM | Weights | 3.63 MB |
+| PSRAM | Working buffers / activations | ~1.0 MB |
+| PSRAM | **Subtotal** | **~5.0 MB of 8 MB** (✔) |
+| Internal SRAM | KV cache (int8, ctx 128) | 192 KB |
 | Internal SRAM | Activations | varies |
-| Flash | Weight partition (OTA-able) | 3.6 MB |
+| Flash | Weight partition | 3.63 MB |
 | Flash | Tokenizer | ~200 KB |
+| Flash | **Subtotal** | **~5.3 MB of 16 MB** (✔) |
+
+KV cache lives in internal SRAM only at context 128 (192 KB); context 256 would
+push it to 393 KB, over the ~327 KB internal budget, forcing slower PSRAM-KV.
 
 ### 5.2 Boot Sequence
 
