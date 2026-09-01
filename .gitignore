@@ -1,0 +1,8 @@
+# Regenerable / large artifacts (keep out of git)
+data/*.jsonl
+checkpoints/
+logs/
+build/
+__pycache__/
+*.pyc
+.DS_Store
