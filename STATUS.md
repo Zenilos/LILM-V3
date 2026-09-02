@@ -12,8 +12,8 @@ the concrete next steps. It is the working record for the solo session; see
 
 The **full student-training pipeline is built and runs end-to-end**, but the
 student still does **not produce meaningfully correct plans in free-run**: the
-clean fp baseline (`fp_v2`, 20k steps, fixed harness) hit **best val_em
-0.2773 @ step 8000** then collapsed (final 0.1230), with train loss ~0.0025 —
+clean fp baseline (`fp_v2`, 20k steps, fixed harness) reached only **full-val
+EM 0.1634** (best checkpoint) with train loss ~0.0025 and false-accept 0.59 —
 a textbook exposure-bias signature. The next lever is scheduled sampling
 (`--sample-prob`), then KD, with QAT deferred until fp EM is stable.
 
@@ -22,7 +22,7 @@ a textbook exposure-bias signature. The next lever is scheduled sampling
 | Data generation (`corpus.py`) | Done. `data/train_a.jsonl` (470,113 unique) + `data/val.jsonl` (3,641 unique). 55/28/9/8 mix. |
 | DSL + wire serialization (`dsl.py`, `serialize.py`) | Done, unit-verified (vocab=4388). |
 | Student model (`train_student.py`; `model.py` trimmed to shared `ModelConfig`) | Done. 11.1M params, tied embed/LM-head, GQA, SwiGLU, RoPE. |
-| QAT training (`train_student.py`) | **fp_v2 baseline complete**: best val_em **0.2773** @ step 8000, final 0.1230, train loss ~0.0025. Exposure bias confirmed → next is scheduled sampling (`--sample-prob`), not QAT. Fixes landed: pointer-decode metric bug, gold alignment, scheduled sampling, KD, `--fp` mode. |
+| QAT training (`train_student.py`) | **fp_v2 baseline complete**: full-val EM **0.1634** (best ckpt; in-run 512-subset over-read to 0.2773), train loss ~0.0025, false-accept 0.59. Exposure bias confirmed → next is scheduled sampling (`--sample-prob`), not QAT. Eval loop now reports full-val + per-kind EM; eval.py gained `--t` (fp decode). |
 | Eval harness (`eval.py`) | Done; loader fixed (unflattens dot-key `.npz`, `model.update`); pointer decode + intent-denominator fixed. |
 | Mid-training inspection (`mid-training-eval.py`) | New; interactive single-prompt eval against any checkpoint (`--t 0.0` fp / `1.0` ternary). |
 | Export (`export.py`) | 3.63 MB blob verified on a checkpoint. |
@@ -148,17 +148,23 @@ the buggy pointer decode).
 | 8000  | **0.2773** | | 18000 | 0.1582 |
 | 10000 | 0.1875 | | 20000 | 0.1230 |
 
-- **Best val_em = 0.2773 @ step 8000**; final val_em = 0.1230.
-- Final training loss ≈ 0.0025 → the model memorized the training set.
-- **Verdict: exposure bias is real and still dominant.** EM peaks mid-run
-  (0.28) then declines and oscillates; per-prompt spot checks on the best
-  checkpoint (`mid-training-eval.py`) fail cleanly (wrong intent / wrong span /
-  spurious extra action). The model overfits the teacher-forced objective but
-  does not condition on the utterance in free-run — exactly the failure mode
-  identified in the fp ablation above, now on a fair harness and schedule.
-- The 0.28 number is `0.10–0.40` territory per the NEXT.md decision table:
-  *meaningful learning but ceiling room* → the scheduled-sampling / KD
-  instruments are the next lever, not QAT.
+**CAVEAT — the in-run numbers above are a 512-row subset.** The training
+loop's `evaluate` sampled `n_eval=512`, which inflated/instabilized the trend.
+The honest **full-val** EM on the best checkpoint (step 8000) is:
+
+- **EM 0.1634** (n=5000) | intent-seq acc 0.3533
+- by chain: atomic **0.178** | pair **0.055** | triple **0.008** | reject **0.412**
+- **false-accept 0.588** (of 1250 reject items the model says `<ok>` 735 times)
+- train loss ≈ 0.0025 → memorized the training set.
+
+**Verdict: exposure bias is real and still dominant.** The honest full-val EM
+is ~0.16, not 0.28. EM collapses with chain length (composition requires
+reading the whole utterance) and the `<no>` gate is effectively never learned
+(0.59 false-accept). The model overfits the teacher-forced objective but does
+not condition on the utterance in free-run — exactly the failure mode
+identified in the fp ablation above, now on a fair harness and schedule.
+Per-prompt spot checks of the best checkpoint fail cleanly (wrong intent /
+wrong span / spurious extra action).
 
 ---
 

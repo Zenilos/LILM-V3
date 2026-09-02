@@ -351,17 +351,29 @@ def greedy_decode(model, utt_words: list[str], utt_ids: list[int],
         return None
 
 
-def evaluate(model, val_items, vocab, fsm, n_eval=512, t: float = 1.0):
+def evaluate(model, val_items, vocab, fsm, n_eval=0, t: float = 1.0):
+    """Greedy-decode val and return (EM, per-kind EM).
+
+    n_eval=0 evaluates the WHOLE validation set (honest number); a positive
+    n_eval samples a fixed-size subset (diagnostic only).
+    """
     correct = total = 0
+    by_kind = {}
     order = list(range(len(val_items)))
     random.Random(0).shuffle(order)
-    for i in order[:n_eval]:
+    if n_eval:
+        order = order[:n_eval]
+    for i in order:
         uid, words, _, _, gold = val_items[i]
+        kind = {1: "atomic", 2: "pair", 3: "triple"}[len(gold)]
         pred = greedy_decode(model, words, uid, vocab, fsm, t=t)
         total += 1
-        if pred is not None and actions_match(pred, gold):
+        ok = pred is not None and actions_match(pred, gold)
+        if ok:
             correct += 1
-    return correct / max(1, total)
+        c, tt = by_kind.get(kind, (0, 0))
+        by_kind[kind] = (c + (1 if ok else 0), tt + 1)
+    return correct / max(1, total), by_kind
 
 
 # --------------------------------------------------------------------------
@@ -555,9 +567,13 @@ def main():
                       f"ramp={ramp:.2f} lr={lr:.2e} "
                       f"{time.time()-t0:.0f}s", flush=True)
             if a.eval_every and step % a.eval_every == 0:
-                em = evaluate(model, val_items, vocab, fsm,
-                              t=0.0 if a.fp else 1.0)
-                print(f"  [eval step {step}] val_em={em:.4f}", flush=True)
+                em, by_kind = evaluate(model, val_items, vocab, fsm,
+                                       t=0.0 if a.fp else 1.0)
+                detail = " ".join(
+                    f"{k}={c}/{tt}({c/max(1,tt):.2f})"
+                    for k, (c, tt) in sorted(by_kind.items()))
+                print(f"  [eval step {step}] val_em={em:.4f} | {detail}",
+                      flush=True)
                 os.makedirs(a.out, exist_ok=True)
                 if em >= best_em:
                     best_em = em

@@ -75,7 +75,7 @@ def load_model(path):
     return model
 
 
-def greedy_decode(model, utt_words, utt_ids, vocab, fsm):
+def greedy_decode(model, utt_words, utt_ids, vocab, fsm, t=1.0):
     n = len(utt_ids)
     inp = mx.array(utt_ids, dtype=mx.int32)[None, :]
     st = fsm.start(n)
@@ -84,7 +84,7 @@ def greedy_decode(model, utt_words, utt_ids, vocab, fsm):
         legal = fsm.legal(st)
         if not legal:
             break
-        logits = model(inp, 1.0)[0, -1, :]
+        logits = model(inp, t)[0, -1, :]
         la = mx.array(sorted(legal), dtype=mx.int32)
         sel = mx.take(logits, la)
         tid = int(la[mx.argmax(sel)].item())
@@ -106,7 +106,7 @@ def greedy_decode(model, utt_words, utt_ids, vocab, fsm):
         return None
 
 
-def run_eval(model, rows, vocab, fsm, bt):
+def run_eval(model, rows, vocab, fsm, bt, t=1.0):
     golds = []
     for r in rows:
         try:
@@ -131,7 +131,7 @@ def run_eval(model, rows, vocab, fsm, bt):
         words = tokenize(r["text"])
         uid = bt.ids(words)
         try:
-            pred = greedy_decode(model, words, uid, vocab, fsm)
+            pred = greedy_decode(model, words, uid, vocab, fsm, t)
         except Exception:
             pred = None
         total += 1
@@ -198,6 +198,9 @@ def main():
     ap.add_argument("--train-words", default="",
                     help="a train jsonl to build the base tokenizer from "
                          "(reproduces training tokenizer exactly)")
+    ap.add_argument("--t", type=float, default=1.0,
+                    help="decode quantization: 0.0=fp (use for --fp runs), "
+                         "1.0=ternary (default, QAT runs)")
     a = ap.parse_args()
 
     vocab = Vocab()
@@ -218,7 +221,7 @@ def main():
                 texts.append(json.loads(line)["text"])
     bt = build_base_tok(texts)
 
-    m = run_eval(model, val, vocab, fsm, bt)
+    m = run_eval(model, val, vocab, fsm, bt, t=a.t)
     print("=== Student Evaluation ===")
     print(f"exact-match (actions_match): {m['em']:.4f}  (n={m['n']})")
     print(f"intent-seq accuracy:         {m['intent_acc']:.4f}")
