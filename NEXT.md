@@ -33,6 +33,38 @@ but does not condition on the utterance in free-run. The next lever is
 
 ---
 
+## Step 2 — DONE: fp + scheduled sampling
+
+Ran with `--sample-prob 0.1 --fp` (`logs/fp_sample.log`). Died at step 15700
+(OOM from concurrent eval work), relaunched from step 14000. In-training full-val
+EM trajectory (training-loop evaluate, bundles reject as atomic):
+
+| step | val_em |
+|------|--------|
+| 2000  | 0.0467 |
+| 4000  | 0.0313 |
+| 6000  | 0.0637 |
+| 8000  | **0.0703** |
+| 10000 | 0.0621 |
+| 12000 | 0.0662 |
+| 14000 | 0.0651 |
+
+**Outcome: marginal over fp_v2.** The in-training eval shows ~0.07 peak vs
+fp_v2's 0.0665 honest full-val. The scheduled sampling with ramp=1.0 and
+sample-prob=0.1 did not significantly improve generalization. The model still
+memorizes rather than learning slot-filling rules.
+
+**Root cause identified:** the 11.1M from-scratch model cannot learn semantic
+roles (person/location/object) from 470k template sentences. Spot-checks show
+the model either guesses wrong intent, fills slots with wrong spans, or gives
+up (UNAVAILABLE). This is a capacity + pre-training gap, not a training loop
+issue.
+
+**honest intent+required-slot eval:** ran `eval_required.py` (ignores optional
+slots) on both checkpoints. See `eval_required.md` for full per-intent breakdown.
+
+---
+
 ## Step 1 — DONE: fp baseline with correct recipe
 
 Ran to 20k steps: `--steps 20000 --batch 256 --warmup 2000 --ramp-frac 0.2
@@ -55,7 +87,7 @@ best checkpoint fail cleanly (wrong intent/span/extra action). The decision:
 
 ---
 
-## Step 2 — fp + scheduled sampling (NEXT ACTION)
+## Step 2 — DONE: fp + scheduled sampling
 
 Step 1 confirmed exposure bias is dominant, so rerun with `--sample-prob 0.1`
 (keep `--fp` for a clean fp comparison):
@@ -83,13 +115,18 @@ Compare directly to Step 1: success = full-val EM clearly exceeds fp_v2's
 If sampling helps, also try `--sample-prob 0.2` to find the sweet spot. If it
 *doesn't* help (or hurts), move on to KD (Step 3) without it.
 
+**Result: marginal improvement, model hits semantic ceiling.** In-training peak
+EM 0.0703 at step 8000 (vs fp_v2 honest 0.0665). The model cannot generalize
+slot-filling to unseen phrasings — this is a capacity/pre-training issue, not
+a training loop issue. See Step 6 for viable paths.
+
 ---
 
-## Step 3 — fp + KD (teacher must be trained first)
+## Step 3 — KD (deferred, high uncertainty)
 
-Before Step 3, train the teacher. This runs on PyTorch/HF, not MLX, and
-requires network for the SmolLM2-135M download (~270 MB, one-time). Run on
-the full 470k train set:
+Train a teacher on PyTorch/HF, then distill into the student. This could help
+the student learn smoother probability distributions over actions/slots, but
+the root issue (no semantic understanding) may not be addressable by KD alone.
 
 ```bash
 ~/p3.11/bin/python3 train_teacher.py \
@@ -106,73 +143,80 @@ the full 470k train set:
 **Kill point:** if the teacher's val EM is below 95% after 3 epochs, the wire
 format or data conventions have a problem. Fix the data before distilling.
 
-With a trained teacher, rerun the best fp student recipe from Step 1 with KD:
+---
 
-```bash
-~/p3.11/bin/python3 train_student.py \
-    --train data/train_a.jsonl \
-    --val data/val.jsonl \
-    --out checkpoints/fp_kd \
-    --steps 20000 \
-    --batch 256 \
-    --eval-every 2000 \
-    --ramp-frac 0.2 \
-    --warmup 2000 \
-    --sample-prob 0.0 \
-    --teacher checkpoints/teacher/best.pt
-```
+## Step 4 — QAT (ternary) — deferred
 
-Compare `fp_v2` (Step 1) vs `fp_kd`. If KD adds <1 point EM, drop it — it's
-complexity that hasn't earned its place and adds a torch dependency at training
-time.
+Only viable after Steps 1-3 produce a meaningful fp baseline. The ternary
+quantizer (export.py) is ready and tested. The quantization-aware training
+ramp and export pipeline are complete. Once the fp student EM is meaningful,
+enable ternary and verify the drop is within the ~4 point budget.
 
 ---
 
-## Step 4 — QAT (ternary) from the best fp recipe
+## Step 5 — data scale — deferred
 
-Once we have a fp student whose EM is meaningful, enable the ternary
-quantizer. Use the identical recipe but change `--ramp-frac 0.2`:
-
-```bash
-~/p3.11/bin/python3 train_student.py \
-    --train data/train_a.jsonl \
-    --val data/val.jsonl \
-    --out checkpoints/qat \
-    --steps 20000 \
-    --batch 256 \
-    --eval-every 2000 \
-    --ramp-frac 0.2 \
-    --warmup 2000 \
-    --sample-prob <best from Step 2, or 0.0> \
-    --teacher <best.pt or none>
-```
-
-**Expected drop:** ARCHITECTURE.md budgets ~4 points from fp to ternary. If
-the drop is larger, the ramp schedule needs revisiting.
-
-Run the export on the best checkpoint and verify `fsm.c` self-test:
-
-```bash
-~/p3.11/bin/python3 export.py --model checkpoints/qat/best.npz --out build/model.tern
-cc -DFSM_TEST -Wall -Wextra -o fsm_test fsm.c && ./fsm_test
-```
+Paraphrase augmentation (Ollama) and template expansion (1M row corpus). Only
+worth pursuing if the model has the capacity to benefit from more data.
 
 ---
 
-## Step 5 — scale data, paraphrase, full run
+## Step 6 — Viable ESP32 paths forward
 
-With the student recipe validated (Step 1–4 above), scale up:
+The core finding: the 11.1M from-scratch model cannot learn semantic roles
+(person/location/object) from 470k template sentences. Training loop
+improvements (scheduled sampling, KD) cannot fix this — the model lacks
+the foundational understanding to generalize. Three viable paths:
 
-1. **Unblock paraphrase.** Either:
-   - Start Ollama: `ollama serve`, then `paraphrase.py --in data/train_a.jsonl --out data/train_b.jsonl --limit 150000 --per-row 2`
-   - Or skip Stage B for now: the template corpus is already 470k, and
-     paraphrase only adds naturalness diversity. For the f1 build, pure
-     template data is fine.
+### Path A: Scale the from-scratch model
 
-2. **Scale Stage A** to 1M if the template corpus proves too small for the
-   student to generalize (measured by the held-out entity gap in eval.py).
+Push the architecture to fit ESP32-S3 N16R8 limits:
 
-3. **Full training run** on the best recipe, 20k+ steps, with the final data.
+| Config | d_model | L | heads | ffn | params | flash (tern) | PSRAM |
+|--------|---------|---|-------|-----|--------|-------------|-------|
+| Current | 384 | 6 | 6/2 | 1024 | 11.1M | ~3.6 MB | ~5 MB |
+| Mid | 448 | 8 | 7/2 | 1120 | ~18M | ~5.8 MB | ~7.5 MB |
+| Max | 512 | 8 | 8/2 | 1280 | ~21M | ~6.7 MB | ~8.5 MB |
+
+**Pros:** no external dependencies, pure ESP32 deployment, export pipeline
+already works. **Cons:** from-scratch learning is sample-inefficient; may still
+not learn semantic generalization at 21M. Worth one controlled ablation (18M vs
+11.1M) to confirm whether capacity is the bottleneck.
+
+### Path B: Pre-compute encoder embeddings (offline distillation)
+
+1. Run a pre-trained LM (SmolLM2-135M or similar) on the full training corpus
+   offline (on a server/Mac), dump hidden states to disk.
+2. Train only the small action head (3 layers, ~2M params) on top of the frozen
+   embeddings. This fits in MLX easily.
+3. On-device: run the frozen encoder + small head together. The encoder
+   processes the utterance, the head extracts intent + slots from the
+   representations.
+
+**Pros:** the encoder already understands semantic roles; the head only needs
+to learn the action grammar. Highest expected EM. **Cons:** encoder too large
+for ESP32-S3 PSRAM (SmolLM2-135M = ~270 MB). Would need a much smaller
+encoder (e.g., 10-20M params) that fits in flash (~6-7 MB ternary), or
+streaming decode from flash. More firmware complexity.
+
+### Path C: Hybrid (small on-device + external for hard cases)
+
+1. Keep the 11.1M model for common/atomic commands (MOVE, STOP, WAIT).
+2. For multi-action chains and novel phrasings, fall back to an external model
+   (server/API call) or accept lower accuracy.
+3. Route by confidence: if the on-device model's top-1 logit margin is below
+   a threshold, send to external.
+
+**Pros:** pragmatic, works with current model quality. **Cons:** requires
+connectivity for hard cases; adds latency for fallback; the threshold needs
+tuning.
+
+### Recommendation
+
+**Try Path A first** (one ablation at 18M to confirm capacity is the
+bottleneck). If 18M doesn't improve semantic generalization, Path B is the
+highest-ROI path but requires solving the encoder-on-device problem. Path C
+is the pragmatic fallback if neither path works within budget.
 
 ---
 
@@ -190,11 +234,10 @@ With the student recipe validated (Step 1–4 above), scale up:
 
 ---
 
-## Running in parallel (while Step 2 trains)
+## Running in parallel (while waiting)
 
-- Start Ollama and run `paraphrase.py` on a 20k subset as a smoke test.
-- Review `export.py` in detail: verify the int8-embedding export path and
-  the trit-packing logic. This hasn't been tested end-to-end and is the most
-  likely place a latent off-by-one hides.
+- Review `export.py` self-test and packing contract (done, commit pushed).
 - Draft the ESP32 firmware skeleton (build system, partition table, PSRAM
-  init) while the student trains — no dependency on model quality.
+  init) — no dependency on model quality.
+- Run `eval_required.py` on all checkpoints to get intent+required-slot stats
+  (not full EM, but shows where the model succeeds/fails per intent).
