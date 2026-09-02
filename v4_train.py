@@ -12,6 +12,7 @@ Metrics on val:
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import math
 import os
@@ -28,6 +29,8 @@ from v4_model import (V4Model, INTENTS, INTENT_TO_ID, SLOT_TO_ID,
 
 WORDS2ID: dict[str, int] = {}
 UNK = 0
+SLOT_LOSS_W = 1.5
+SLOT_W_CAP = 4.0
 
 # map a data slot name (after stripping INTENT-) to the shared BIO tag family
 SLOT_FAMILY = {
@@ -40,6 +43,30 @@ SLOT_FAMILY = {
     "duration_amount": "duration",
     "duration_unit": "duration",
 }
+
+
+def compute_slot_weights(rows):
+    """Effective-number / smoothed inverse-frequency weights per slot class so
+    rare tags (B-*/I-*) are boosted relative to the dominant O label, but the
+    scaling stays gentle (capped) so the loss still learns O well."""
+    per_cls = collections.Counter()
+    for r in rows:
+        for key, tags in r.get("slots", {}).items():
+            fam = key.split("-", 1)[1]
+            fam = SLOT_FAMILY.get(fam, fam)
+            for t in tags.split():
+                slab = f"{t}-{fam}" if t != "O" else "O"
+                per_cls[slab] += 1
+    n_cls = N_SLOT_CLASSES
+    counts = np.array([per_cls[SLOT_LABELS[i]] for i in range(n_cls)], dtype=np.float32)
+    counts = np.maximum(counts, 0.0)
+    # O is the reference class (weight 1.0); rarer classes get boosted,
+    # capped at SLOT_W_CAP so they don't dominate. Empty classes get the cap.
+    o_denom = max(1.0, counts[0])
+    w = (o_denom + 1.0) / (1.0 + counts)
+    w = np.minimum(w, SLOT_W_CAP)
+    w[0] = 1.0  # O exactly 1.0
+    return mx.array(w)
 
 
 def parse_row(r: dict, max_len: int) -> tuple[list[int], int, list[int]]:
@@ -211,6 +238,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-3)
+    ap.add_argument("--slot-w", type=float, default=SLOT_LOSS_W)
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
@@ -233,9 +261,7 @@ def main():
     print(f"vocab={len(bt.word2id)} params={_nparams(model.parameters())}")
 
     opt = optim.AdamW(learning_rate=a.lr)
-    optstate = opt.state
-
-    opt = optim.AdamW(learning_rate=a.lr)
+    slot_weights = compute_slot_weights(train_rows)
 
     def loss_fn(mod, toks, m, it_gold, slots_gold):
         it_logits, slot_logits = mod(toks, m)
@@ -244,10 +270,11 @@ def main():
         fg = slots_gold.reshape(-1)
         fm = m.reshape(-1)
         per = nn.losses.cross_entropy(flat, fg, reduction="none")
-        sl_ce = (per * fm).sum() / mx.maximum(fm.sum(), 1.0)
-        return it_ce + sl_ce
+        # per-token class weights from the target label
+        w = mx.take(slot_weights, fg)
+        sl_ce = (per * w * fm).sum() / mx.maximum((fm * w).sum(), 1.0)
+        return it_ce + a.slot_w * sl_ce
 
-    # differentiate w.r.t. the model (argnums=0); loss is a function of model output
     loss_and_grad = mx.value_and_grad(loss_fn, argnums=0)
 
     print("training...")
