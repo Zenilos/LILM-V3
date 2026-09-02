@@ -42,12 +42,46 @@ def ternary_channel(w: np.ndarray, t: float = 1.0) -> np.ndarray:
 
 
 def pack_trits(trits: np.ndarray) -> np.ndarray:
+    """Pack row-major trits {-1,0,+1} into uint8 bytes, 5 trits/byte.
+
+    PACKING CONTRACT (the C firmware must decode this exact layout):
+      * encode -1,0,+1 as base-3 digits 0,1,2
+      * a byte at index b stores trits at flat positions 5b .. 5b+4:
+          byte_b = SUM_{i=0..4} digit_{5b+i} * 3^i
+      * the last byte may hold <5 trits (trailing zeros are padding; the
+        element count is known from the tensor shape in manifest.json)
+      * decode: digit_{5b+i} = (byte_b // 3^i) % 3
+    """
     codes = (trits.astype(np.int64) + 1)  # -1,0,1 -> 0,1,2
     n = codes.size
     pad = (-n) % _TRITS_PER_BYTE
     codes = np.append(codes, np.zeros(pad, dtype=np.int64))
     codes = codes.reshape(-1, _TRITS_PER_BYTE)
     return (codes * _BASE3).sum(axis=1).astype(np.uint8)
+
+
+def unpack_trits(packed: np.ndarray, n: int) -> np.ndarray:
+    """Inverse of pack_trits; reference decode for the C firmware and tests."""
+    pb = packed.astype(np.int64)
+    codes = np.empty(n, dtype=np.int64)
+    for i in range(5):
+        sel = np.arange(i, n, 5)
+        codes[sel] = (pb[sel // 5] // _BASE3[i]) % 3
+    return (codes - 1).astype(np.int8)
+
+
+def roundtrip_selftest(w: np.ndarray, t: float = 1.0) -> bool:
+    """Pack → unpack a random ternary tensor and require exact recovery."""
+    rng = np.random.default_rng(0)
+    wt = rng.normal(size=w.shape)
+    q = ternary_channel(wt, t)
+    rec = unpack_trits(pack_trits(q.reshape(-1)), q.size).reshape(q.shape)
+    if not bool((rec == q).all()):
+        return False
+    q2, _ = int8_rows(np.float64(wt))
+    s2 = np.abs(wt).max(axis=-1, keepdims=True) / 127.0 + 1e-9
+    ref = np.clip(np.round(wt / s2), -127, 127).astype(np.int8)
+    return bool((q2 == ref).all())
 
 
 def int8_rows(w: np.ndarray):
@@ -61,7 +95,16 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", default="build/export")
     ap.add_argument("--ramp", type=float, default=1.0)
+    ap.add_argument("--selftest", action="store_true",
+                    help="round-trip pack/unpack a random tensor and exit "
+                         "(locks the packing contract for the C firmware)")
     a = ap.parse_args()
+
+    if a.selftest:
+        if roundtrip_selftest(np.empty((16, 32))):
+            print("selftest OK: ternary trit-packing + int8 round-trip exact")
+            return
+        raise SystemExit("selftest FAILED")
 
     data = np.load(a.model, allow_pickle=False)
     os.makedirs(a.out, exist_ok=True)
