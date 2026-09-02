@@ -1,6 +1,6 @@
 # STATUS — PlanCore-11M (training investigation)
 
-_Last updated: 2026-09-01_
+_Last updated: 2026-09-02_
 
 This file documents what exists, what we found while debugging training, and
 the concrete next steps. It is the working record for the solo session; see
@@ -10,19 +10,19 @@ the concrete next steps. It is the working record for the solo session; see
 
 ## Where things stand
 
-The **full student-training pipeline is built and runs end-to-end**, but does
-**not yet produce a model with meaningful exact-match (EM) on the validation
-set**. We found the precise failure mode via an fp-vs-QAT ablation and have
-landed the fixes (corrected EM harness, schedule-sampled training, optional KD,
-`--fp` mode). **A clean fp baseline is training now** (`checkpoints/fp_v2`,
-PID on the M1); the first eval checkpoint scored **val_em=0.1934** at step 2000.
+The **full student-training pipeline is built and runs end-to-end**, but the
+student still does **not produce meaningfully correct plans in free-run**: the
+clean fp baseline (`fp_v2`, 20k steps, fixed harness) hit **best val_em
+0.2773 @ step 8000** then collapsed (final 0.1230), with train loss ~0.0025 —
+a textbook exposure-bias signature. The next lever is scheduled sampling
+(`--sample-prob`), then KD, with QAT deferred until fp EM is stable.
 
 | Component | Status |
 |---|---|
 | Data generation (`corpus.py`) | Done. `data/train_a.jsonl` (470,113 unique) + `data/val.jsonl` (3,641 unique). 55/28/9/8 mix. |
 | DSL + wire serialization (`dsl.py`, `serialize.py`) | Done, unit-verified (vocab=4388). |
 | Student model (`train_student.py`; `model.py` trimmed to shared `ModelConfig`) | Done. 11.1M params, tied embed/LM-head, GQA, SwiGLU, RoPE. |
-| QAT training (`train_student.py`) | **Training now** (fp_v2 baseline, 20k steps). Fixes landed: pointer-decode metric bug, gold alignment, scheduled sampling (`--sample-prob`), KD (`--teacher`), true-fp mode (`--fp`). First real result: **val EM 0.1934 @ step 2000** (vs 0.023 on the old buggy run). |
+| QAT training (`train_student.py`) | **fp_v2 baseline complete**: best val_em **0.2773** @ step 8000, final 0.1230, train loss ~0.0025. Exposure bias confirmed → next is scheduled sampling (`--sample-prob`), not QAT. Fixes landed: pointer-decode metric bug, gold alignment, scheduled sampling, KD, `--fp` mode. |
 | Eval harness (`eval.py`) | Done; loader fixed (unflattens dot-key `.npz`, `model.update`); pointer decode + intent-denominator fixed. |
 | Mid-training inspection (`mid-training-eval.py`) | New; interactive single-prompt eval against any checkpoint (`--t 0.0` fp / `1.0` ternary). |
 | Export (`export.py`) | 3.63 MB blob verified on a checkpoint. |
@@ -130,54 +130,69 @@ consistent with this, not an independent quantization failure.
 
 ---
 
-## New fp baseline (in progress)
+## fp_v2 baseline run — COMPLETE
 
-A clean fp run on the **fixed** harness and **correct** schedule is training:
-`--steps 20000 --batch 256 --warmup 2000 --ramp-frac 0.2 --fp` (`logs/fp_v2.log`,
-`checkpoints/fp_v2/`). This supersedes the stale `fp_ab.log` (that run was 100%
-warmup with no cosine decay and was scored on the buggy pointer decode).
+A clean fp run on the **fixed** harness and the **correct** schedule ran to
+completion: `--steps 20000 --batch 256 --warmup 2000 --ramp-frac 0.2 --fp`
+(`logs/fp_v2.log`, `checkpoints/fp_v2/`). This supersedes the stale
+`fp_ab.log` (that run was 100% warmup with no cosine decay and was scored on
+the buggy pointer decode).
 
-**Result so far:**
-- **val_em = 0.1934 @ step 2000** (measured at LR peak, still early). First
-  truly valid EM number; ~8× the 0.023 the old buggy run capped at.
-- Training loss already ~0.005–0.013 (approaching train memorization).
+**Result — val EM curve (fixed harness):**
 
-**Caveat:** ~2000 training steps is far short of convergence; the cosine decay
-covers the remaining 18k steps. The decisive number is mid-/late-run EM (steps
-4000, 6000, ... 20000), not the step-2000 spike. Mid-run inspection with
-`mid-training-eval.py` confirms the model still produces valid-but-wrong plans
-(e.g. `MOVE{location:"my desk"}` + a spurious second action) — expected at LR
-peak.
+| step | val_em | | step | val_em |
+|------|--------|-|------|--------|
+| 2000  | 0.1934 | | 12000 | 0.1738 |
+| 4000  | 0.2012 | | 14000 | 0.2422 |
+| 6000  | 0.1484 | | 16000 | 0.1016 |
+| 8000  | **0.2773** | | 18000 | 0.1582 |
+| 10000 | 0.1875 | | 20000 | 0.1230 |
+
+- **Best val_em = 0.2773 @ step 8000**; final val_em = 0.1230.
+- Final training loss ≈ 0.0025 → the model memorized the training set.
+- **Verdict: exposure bias is real and still dominant.** EM peaks mid-run
+  (0.28) then declines and oscillates; per-prompt spot checks on the best
+  checkpoint (`mid-training-eval.py`) fail cleanly (wrong intent / wrong span /
+  spurious extra action). The model overfits the teacher-forced objective but
+  does not condition on the utterance in free-run — exactly the failure mode
+  identified in the fp ablation above, now on a fair harness and schedule.
+- The 0.28 number is `0.10–0.40` territory per the NEXT.md decision table:
+  *meaningful learning but ceiling room* → the scheduled-sampling / KD
+  instruments are the next lever, not QAT.
 
 ---
 
 ## Next steps (in order of leverage)
 
-1. **Let the fp_v2 baseline finish** (20k steps, ~7–8 h total). Read val EM
-   trend across eval checkpoints. If EM peaks then collapses, that confirms
-   exposure bias and points to schedule-sampling / input-conditioning (below);
-   if it keeps climbing, the earlier near-zero EM was dominated by the metric
-   artifact + a never-decaying schedule, and plain CE may already work.
+1. **DONE — fp_v2 baseline (see table above).** Exposure-bias signature
+   confirmed: EM peaks mid-run (0.2773 @ 8000) then collapses/oscillates;
+   train loss ~0.0025 (memorization) with free-run failures on clean prompts.
 
-2. **Scheduled sampling — implemented, awaiting a validation run.** Live as
-   `--sample-prob` (default 0). At each label position the model's own greedy
-   argmax is fed back as input instead of the gold token, with probability
-   ramping in over the first half of the run; loss labels stay gold. If the
-   plain fp baseline shows the exposure-bias signature (EM peak-then-collapse),
-   rerun with `--sample-prob 0.1` and compare.
+2. **Scheduled sampling — implemented, now the primary lever.** Live as
+   `--sample-prob`. At each label position the model's own greedy argmax is
+   fed back as input instead of the gold token, with probability ramping in
+   over the first half of the run; loss labels stay gold. Run next:
+   `--sample-prob 0.1` (fp), same recipe as fp_v2. Success = a higher,
+   more stable EM curve than fp_v2 (beyond ~0.28 best), not a mid-run spike.
+   Optionally try `0.2` for the sweet spot; if it hurts, drop it for KD.
 
-3. **Strengthen input-conditioning** if needed: prevent the model from
-   shortcutting on label-pattern context (e.g. block attention from label
-   positions to other label positions so intents/pointers must be read from the
-   utterance), and/or weight intent tokens more heavily in `ce_loss`.
+3. **KD (teacher must be trained first)** if scheduled sampling alone is
+   insufficient. Train the teacher (torch/HF, ~270 MB download) and distill;
+   compare fp+sample vs fp+KD. If KD adds <1 point, drop it (added torch
+   dependency at train time).
 
-4. **Only after a working fp student** (fp val EM meaningful): re-enable QAT
-   (`--ramp-frac 0.2`) and confirm the quantized model lands within the
-   ~4-point EM drop budget from ARCHITECTURE.md. If QAT still collapses,
-   revisit the ternary quantizer (BitNet-style scale factors / sub-2-bit pack).
+4. **Strengthen input-conditioning** if exposure bias persists after 2–3:
+   block attention from label positions to other label positions so
+   intents/pointers must be read from the utterance, and/or weight intent
+   tokens more heavily in `ce_loss`.
 
-5. Resume the full 20k-step run on the fixed recipe, then re-examine
-   `export.py` output and the ESP32 FSM path.
+5. **QAT (ternary) only once fp EM is meaningful and stable.** Re-enable
+   `--ramp-frac 0.2` and confirm the quantized model lands within the ~4-point
+   EM drop budget from ARCHITECTURE.md. If QAT collapses, revisit the ternary
+   quantizer (BitNet-style scale factors / sub-2-bit pack).
+
+6. **Deployment path** once a quantized model holds EM: export, ESP32 FSM,
+   and the `export.py`/`fsm.c` review that has been deferred.
 
 ---
 

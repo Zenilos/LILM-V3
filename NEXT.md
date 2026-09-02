@@ -1,94 +1,61 @@
 # NEXT.md — What to do now
 
-_Last updated: 2026-09-01_
+_Last updated: 2026-09-02_
 
 This is a working plan, not a design doc. It picks up after commit `0cd1536`
-(all bug fixes, scheduled sampling, KD, model.py reconciliation). Nothing is
-currently training.
+(all bug fixes, scheduled sampling, KD, model.py reconciliation) and the
+**completed fp_v2 baseline** (Step 1, see below).
 
 ---
 
 ## Where we actually are
 
-All pipeline code is written and runnable. All known correctness bugs are fixed.
-Scheduled sampling is implemented (`--sample-prob`). KD distillation is
-implemented (`--teacher`). The training log is stale:
+Step 1 (clean fp baseline) is **done**. All pipeline code is written and
+runnable. known correctness bugs are fixed. Scheduled sampling is implemented
+(`--sample-prob`). KD distillation is implemented (`--teacher`). Current facts:
 
-- **`fp_ab.log`**: ran with `--ramp-frac 100 --warmup 3000 --steps 3000`, so
-  the *entire* 3000-step run was still in warmup (lr never decayed) and the
-  quantizer never ramped. This means the "exposure bias" diagnosis is valid
-  (train EM ~0.005 with free-run 2/30 intents), but the run never exercised the
-  cosine schedule or the ternary ramp — it is not a fair fp baseline.
-- **val_em=0.0234 was measured on the buggy harness** (pointer decode against
-  `"x"` text). The true EM with the fixed harness could be higher or lower.
-- **No teacher checkpoint exists.** The teacher script has never been run.
+- **`fp_v2` baseline ran 20k steps to completion** on the fixed harness with
+  the correct cosine schedule. Best val_em = **0.2773 @ step 8000**, final
+  0.1230, train loss ≈ 0.0025 (memorized train). Curve oscillates and peaks
+  mid-run → exposure bias is confirmed and dominant. This is the number every
+  subsequent experiment compares against.
+- **`fp_ab.log` was a warmup-only, buggy-harness run** — superseded, keep only
+  as historical evidence for the exposure-bias diagnosis.
+- **No teacher checkpoint exists.** The teacher script has never been run
+  (needs torch/HF + network for the SmolLM2-135M download).
 - **No paraphrase data exists.** Ollama is not reachable.
-- **Full training has never been run for 20k+ steps.** The 3000-step run
-  stopped at 6400/20000 in a prior QAT attempt that was also on the buggy
-  harness.
+- **nothing is currently training** (fp_v2 finished).
 
-**Bottom line:** we have never run the student on the *correct* recipe
-(cosine decay + quantizer ramp + correct eval harness). That is the single
-most important thing to do next.
+**Bottom line:** plain CE fp training memorizes the teacher-forced objective
+but does not condition on the utterance in free-run. The next lever is
+**scheduled sampling** (Step 2), already implemented and unproven.
 
 ---
 
-## Step 1 — fp ablation with correct recipe (highest priority)
+## Step 1 — DONE: fp baseline with correct recipe
 
-Run the fp student (no quantization) through a complete training run with the
-right schedule, and measure val EM on the fixed harness. This is the baseline
-against which everything else is compared.
+Ran to 20k steps: `--steps 20000 --batch 256 --warmup 2000 --ramp-frac 0.2
+--fp` (`logs/fp_v2.log`, `checkpoints/fp_v2/`). Val EM curve:
 
-```bash
-~/p3.11/bin/python3 train_student.py \
-    --train data/train_a.jsonl \
-    --val data/val.jsonl \
-    --out checkpoints/fp_v2 \
-    --steps 20000 \
-    --batch 256 \
-    --eval-every 2000 \
-    --ramp-frac 0.2 \
-    --warmup 2000 \
-    --sample-prob 0.0 \
-    --teacher none \
-    --max-len 256 \
-    --fp
-```
+| step | val_em | | step | val_em |
+|------|--------|-|------|--------|
+| 2000  | 0.1934 | | 12000 | 0.1738 |
+| 4000  | 0.2012 | | 14000 | 0.2422 |
+| 6000  | 0.1484 | | 16000 | 0.1016 |
+| 8000  | **0.2773** | | 18000 | 0.1582 |
+| 10000 | 0.1875 | | 20000 | 0.1230 |
 
-**Why this is the right command:**
-- `--fp`: forces the ramp `t` to 0 for both training AND greedy decode. There
-  is no separate fp flag in the code — quantization strength is the ramp value
-  `t` (0 = latent fp, 1 = fully ternary), and `greedy_decode` otherwise decodes
-  at `t=1.0`, which would snap the latent fp weights to ternary {-1,0,+1}.
-  `--fp` makes this a clean, unquantized capacity/exposure-bias baseline.
-- `--ramp-frac 0.2`: kept so the config stays canonical for later QAT runs,
-  but it is inert while `--fp` is on.
-- `--warmup 2000`: 2000-step warmup, then cosine decay over 18k steps. This is
-  the schedule the paper specifies. The old fp_ab.log never left warmup.
-- `--sample-prob 0.0`: no scheduled sampling yet — this isolates the baseline
-  exposure bias on the fixed harness.
-- `--teacher none`: no KD yet — pure hard-label CE.
-
-**Run this before anything else.** It takes ~7.5 hours at ~1.3s/step. Run it
-overnight. The expected outcomes:
-
-| EM result | interpretation | next step |
-|-----------|----------------|-----------|
-| val_em ≈ 0 | harness still broken or model can't learn at all | debug harness, not the model |
-| val_em 0.02–0.10 | exposure bias remains dominant | enable scheduled sampling (Step 2) |
-| val_em 0.10–0.40 | meaningful learning, ceiling room for scheduled sampling | run KD ablation (Step 3) |
-| val_em > 0.40 | student is learning; exposure bias largely solved | move straight to QAT (Step 4) |
-
-**Monitor** `best_em` and the per-kind EM breakdown (`atomic` should be
-strongest, `triple` weakest). Also watch whether EM peaks mid-run then declines
-(overfitting → lower the lr or increase warmup).
+**Outcome: exposure bias confirmed.** The 0.28 best is in the `0.10–0.40`
+band of the decision table → scheduled sampling / KD is the next lever, NOT
+QAT. Spot checks of the best checkpoint via `mid-training-eval.py` fail cleanly
+on simple prompts (wrong intent, wrong span, spurious second action).
 
 ---
 
-## Step 2 — fp + scheduled sampling (if Step 1 EM < 0.10)
+## Step 2 — fp + scheduled sampling (NEXT ACTION)
 
-If exposure bias is still dominant, rerun with `--sample-prob 0.1` (keep
-`--fp` for a clean fp comparison):
+Step 1 confirmed exposure bias is dominant, so rerun with `--sample-prob 0.1`
+(keep `--fp` for a clean fp comparison):
 
 ```bash
 ~/p3.11/bin/python3 train_student.py \
@@ -101,17 +68,17 @@ If exposure bias is still dominant, rerun with `--sample-prob 0.1` (keep
     --ramp-frac 0.2 \
     --warmup 2000 \
     --sample-prob 0.1 \
-    --teacher none
+    --teacher none \
+    --fp
 ```
 
 The sampling probability ramps from 0 to 0.1 over the first 10k steps, then
-holds at 0.1. Two forwards per batch = ~2× compute. Compare directly to
-Step 1.
+holds at 0.1. Two forwards per batch = ~2× compute (≈ 2.6 s/step, ~15 h).
+Compare directly to Step 1: success = the EM curve exceeds fp_v2's 0.2773 best
+and stays up (fp_v2 peaked then collapsed).
 
 If sampling helps, also try `--sample-prob 0.2` to find the sweet spot. If it
-*doesn't* help (or hurts), move on to KD (Step 3) without it — the exposure
-bias diagnosis might already be overcome by the fixed harness and proper
-schedule.
+*doesn't* help (or hurts), move on to KD (Step 3) without it.
 
 ---
 
@@ -220,7 +187,7 @@ With the student recipe validated (Step 1–4 above), scale up:
 
 ---
 
-## Running in parallel (while Step 1 trains)
+## Running in parallel (while Step 2 trains)
 
 - Start Ollama and run `paraphrase.py` on a 20k subset as a smoke test.
 - Review `export.py` in detail: verify the int8-embedding export path and
