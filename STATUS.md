@@ -13,8 +13,8 @@ the concrete next steps. It is the working record for the solo session; see
 The **full student-training pipeline is built and runs end-to-end**, but the
 student still does **not produce meaningfully correct plans in free-run**: the
 clean fp baseline (`fp_v2`, 20k steps, fixed harness) reached only **full-val
-EM 0.1634** (best checkpoint) with train loss ~0.0025 and false-accept 0.59 —
-a textbook exposure-bias signature. The next lever is scheduled sampling
+EM 0.0665** (best checkpoint, deduped n=3641) with train loss ~0.0025 — a
+textbook exposure-bias signature. The next lever is scheduled sampling
 (`--sample-prob`), then KD, with QAT deferred until fp EM is stable.
 
 | Component | Status |
@@ -22,7 +22,7 @@ a textbook exposure-bias signature. The next lever is scheduled sampling
 | Data generation (`corpus.py`) | Done. `data/train_a.jsonl` (470,113 unique) + `data/val.jsonl` (3,641 unique). 55/28/9/8 mix. |
 | DSL + wire serialization (`dsl.py`, `serialize.py`) | Done, unit-verified (vocab=4388). |
 | Student model (`train_student.py`; `model.py` trimmed to shared `ModelConfig`) | Done. 11.1M params, tied embed/LM-head, GQA, SwiGLU, RoPE. |
-| QAT training (`train_student.py`) | **fp_v2 baseline complete**: full-val EM **0.1634** (best ckpt; in-run 512-subset over-read to 0.2773), train loss ~0.0025, false-accept 0.59. Exposure bias confirmed → next is scheduled sampling (`--sample-prob`), not QAT. Eval loop now reports full-val + per-kind EM; eval.py gained `--t` (fp decode). |
+| QAT training (`train_student.py`) | **fp_v2 baseline complete**: full-val EM **0.0665** (deduped n=3641; 512-subset + non-deduped running over-read to 0.28/0.16), train loss ~0.0025. Exposure bias confirmed → next is scheduled sampling (`--sample-prob`), not QAT. Eval loop now reports full-val + per-kind EM; eval.py dedupes like load_rows and gained `--t` (fp decode). |
 | Eval harness (`eval.py`) | Done; loader fixed (unflattens dot-key `.npz`, `model.update`); pointer decode + intent-denominator fixed. |
 | Mid-training inspection (`mid-training-eval.py`) | New; interactive single-prompt eval against any checkpoint (`--t 0.0` fp / `1.0` ternary). |
 | Export (`export.py`) | 3.63 MB blob verified on a checkpoint. |
@@ -148,22 +148,24 @@ the buggy pointer decode).
 | 8000  | **0.2773** | | 18000 | 0.1582 |
 | 10000 | 0.1875 | | 20000 | 0.1230 |
 
-**CAVEAT — the in-run numbers above are a 512-row subset.** The training
-loop's `evaluate` sampled `n_eval=512`, which inflated/instabilized the trend.
-The honest **full-val** EM on the best checkpoint (step 8000) is:
+**CAVEAT — the in-run numbers above are a 512-row subset AND the val file is
+pre-deduped here.** `data/val.jsonl` has 5,000 lines but only **3,641 unique
+texts** (263 copies of "find me a flight"); `load_rows` dedupes, so the honest
+universe is 3,641. `eval.py` now dedupes identically. The honest **full-val
+EM** on the best checkpoint (step 8000) is:
 
-- **EM 0.1634** (n=5000) | intent-seq acc 0.3533
-- by chain: atomic **0.178** | pair **0.055** | triple **0.008** | reject **0.412**
-- **false-accept 0.588** (of 1250 reject items the model says `<ok>` 735 times)
+- **EM 0.0665** (n=3641) | intent-seq acc 0.1911
+- by chain: atomic **0.146** | pair **0.054** | triple **0.005** | reject 3/5
+- reject class is only **5 unique examples** in val — false-accept stats are
+  statistically meaningless at that n (the earlier 0.588 was an artifact of
+  counting duplicate reject lines)
 - train loss ≈ 0.0025 → memorized the training set.
 
-**Verdict: exposure bias is real and still dominant.** The honest full-val EM
-is ~0.16, not 0.28. EM collapses with chain length (composition requires
-reading the whole utterance) and the `<no>` gate is effectively never learned
-(0.59 false-accept). The model overfits the teacher-forced objective but does
-not condition on the utterance in free-run — exactly the failure mode
-identified in the fp ablation above, now on a fair harness and schedule.
-Per-prompt spot checks of the best checkpoint fail cleanly (wrong intent /
+**Verdict: exposure bias is real and dominant.** The honest full-val EM is
+~0.07, far below the 512-subset over-read (0.2773). EM collapses with chain
+length (composition requires reading the whole utterance) and the model
+overfits the teacher-forced objective without conditioning on the utterance in
+free-run. Per-prompt spot checks of the best checkpoint fail (wrong intent /
 wrong span / spurious extra action).
 
 ---

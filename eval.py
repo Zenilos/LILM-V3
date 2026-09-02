@@ -207,12 +207,21 @@ def main():
     fsm = FSM(vocab)
     model = load_model(a.model)
 
-    val = [json.loads(l) for l in open(a.val)]
-    for r in val:
+    val = []
+    seen = set()
+    for line in open(a.val):
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        if rec["text"] in seen:
+            continue  # dedupe by text, matching train_student.load_rows
+        seen.add(rec["text"])
         try:
-            r["_acts"] = [Action.from_dict(x) for x in r["actions"]]
+            rec["_acts"] = [Action.from_dict(x) for x in rec["actions"]]
         except Exception:
             pass
+        val.append(rec)
     # rebuild tokenizer from all texts seen (val) or train for parity
     texts = [r["text"] for r in val]
     if a.train_words:

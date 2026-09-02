@@ -15,10 +15,11 @@ runnable. known correctness bugs are fixed. Scheduled sampling is implemented
 (`--sample-prob`). KD distillation is implemented (`--teacher`). Current facts:
 
 - **`fp_v2` baseline ran 20k steps to completion** on the fixed harness with
-  the correct cosine schedule. Full-val EM on the best checkpoint = **0.1634**
-  (intent-acc 0.35, triple 0.008, false-accept 0.59), train loss ≈ 0.0025
-  (memorized). The in-run 512-subset "0.2773 best" was an over-read — the eval
-  loop is fixed to full-val + per-kind now.
+  the correct cosine schedule. Full-val EM on the best checkpoint = **0.0665**
+  (deduped n=3641; intent-acc 0.19, triple 0.005), train loss ≈ 0.0025
+  (memorized). The in-run 512-subset "0.2773 best" was a large over-read — the
+  eval loop is fixed to full-val + per-kind now, and eval.py dedupes val by
+  text (5000 lines → 3641 unique) exactly like `load_rows`.
 - **`fp_ab.log` was a warmup-only, buggy-harness run** — superseded, keep only
   as historical evidence for the exposure-bias diagnosis.
 - **No teacher checkpoint exists.** The teacher script has never been run
@@ -45,13 +46,12 @@ Ran to 20k steps: `--steps 20000 --batch 256 --warmup 2000 --ramp-frac 0.2
 | 8000  | **0.2773** | | 18000 | 0.1582 |
 | 10000 | 0.1875 | | 20000 | 0.1230 |
 
-**Outcome: exposure bias confirmed (and the in-run number was inflated).**
-The training loop's `n_eval=512` subset showed 0.2773 "best"; the honest
-full-val EM on the best checkpoint is **0.1634** (intent-acc 0.3533, triple
-0.008, reject ret 0.412, false-accept 0.588). Spot checks of the best
-checkpoint fail cleanly (wrong intent/span/extra action). The decision-table
-band for a fixed objective is: **fix exposure bias first — scheduled sampling /
-KD, NOT QAT.**
+**Outcome: exposure bias confirmed (and in-run numbers were over-reads).**
+The training loop's `n_eval=512` subset showed 0.2773 "best" and a
+non-deduped full run showed 0.16 — the honest deduped full-val EM on the best
+checkpoint is **0.0665** (intent-acc 0.19, triple 0.005). Spot checks of the
+best checkpoint fail cleanly (wrong intent/span/extra action). The decision:
+**fix exposure bias first — scheduled sampling / KD, NOT QAT.**
 
 ---
 
@@ -78,8 +78,7 @@ Step 1 confirmed exposure bias is dominant, so rerun with `--sample-prob 0.1`
 The sampling probability ramps from 0 to 0.1 over the first 10k steps, then
 holds at 0.1. Two forwards per batch = ~2× compute (≈ 2.6 s/step, ~15 h).
 Compare directly to Step 1: success = full-val EM clearly exceeds fp_v2's
-**0.1634** and stays up (fp_v2 collapsed with chain length + never learned the
-`<no>` gate).
+**0.0665** and stays up (fp_v2 collapsed with chain length).
 
 If sampling helps, also try `--sample-prob 0.2` to find the sweet spot. If it
 *doesn't* help (or hurts), move on to KD (Step 3) without it.
