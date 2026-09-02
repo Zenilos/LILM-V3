@@ -8,6 +8,46 @@ This is a working plan, not a design doc. It picks up after commit `0cd1536`
 
 ---
 
+## V4 — joint intent + slot-tagger (current work, on branch `V4`)
+
+The generative FSM student can't learn semantic roles. On `V4` we switched to a
+joint intent + BIO slot-tagging model over **atomic** commands. Status:
+
+- **Intent works: 85.9% atomic intent** (STOP 100%, WAIT 99%, SHOW 96%,
+  MOVE 89%; weak spots PLAY 62%, HANDOVER 71%). Model = 879k params,
+  d=192/L=2, 64k balanced rows. This is the branch's win.
+- **Slot extraction does NOT work:** object/file ≈ 0%, location 5%, message 4%;
+  only duration 100%. Slot head collapses to predicting `O`. Span F1 ~0.19-0.31
+  and unstable. Class-weight + slot-loss changes didn't fix it; bigger model
+  gave a noisy 0.31 peak.
+
+### Next steps to fix the slot head (in rough priority)
+
+1. **Structured/CRF slot head.** The BIO sequence has hard constraints
+   (no `I-` without preceding `B-`/`I-` same family; one span per slot). A CRF
+   or constrained decoding pass would stop the all-`O` collapse and clean up
+   span boundaries. Best ROI given the intent head already works.
+2. **Slot-aware decoding / confidence gating.** When slot extraction is low
+   confidence, return intent-only and let the robot ask / fall back — turns the
+   86% intent win into useful behavior today.
+3. **Dedicated slot decoder** (or copy tag-family info into the slot head via
+   the intent embedding) to help spans follow the predicted intent.
+4. If a strong slot model is required and on-device budget allows, revisit a
+   larger or pre-trained-backed encoder (offline distillation, NEXT.md Path B).
+
+### Re-usable pieces
+
+`v4_decompose.py` (chain→atomic, alignment-verified), `v4_data.py` (per-intent
+balanced atomic set), `v4_model.py` / `v4_train.py` (trainer with class-weighted
+slot loss + span-F1 eval), `v4_eval.py` (per-intent + per-family value
+extraction using the train-built vocab).
+
+Docs updated: STATUS.md V4 section.
+
+---
+
+<!-- main-branch generative investigation continues below -->
+
 ## Where we actually are
 
 Step 1 (clean fp baseline) is **done**. All pipeline code is written and

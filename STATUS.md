@@ -8,6 +8,53 @@ the concrete next steps. It is the working record for the solo session; see
 
 ---
 
+## V4 branch — joint intent + slot-tagger pivot (atomic commands)
+
+The generative end-to-end FSM student ceilings at ~7-8% even intent-only
+(section below). On the `V4` branch we replaced it with the classic **joint
+intent classification + BIO slot-tagging** architecture (shared bidirectional
+encoder, two heads) targeting **atomic** commands only; chains are deferred.
+
+Data: decomposed the original pair/triple chains into atomic clauses
+(`v4_decompose.py`, 0 alignment mismatches on 2000-chain validation) giving a
+850k-clause atomic pool, then balanced 8,000 rows per intent (`v4_data.py`):
+64k train / 2,035 val. Labels are per-family BIO tags (duration_amount+unit
+share one `duration` family).
+
+Results (d=192/L=2, 879k params, class-weighted + slot@1.5 loss):
+
+| metric | value |
+|---|---|
+| **intent acc (atomic, exact)** | **85.9%** |
+| MOVE / CLEAN / SHOW / WAIT / STOP | 89 / 86 / 96 / 99 / 100% |
+| HANDOVER / PLAY / UNAVAILABLE | 71 / 62 / 40% |
+| slot token acc | ~70% |
+| slot span F1 | **~0.19-0.31 (unstable)** |
+| slot value extraction | duration 100%; person 14%, recipient 21%, location 5%, message 4%, **object 0, file 0** |
+
+**Verdict:** the intent head is the breakthrough — 86% atomic intent vs the
+generative model's 7-8% — and is small enough for ESP32 (879k params, ~1199
+word vocab). The **slot head does not reliably extract spans**: it collapses
+toward predicting `O` everywhere (under-detection), so value extraction for
+object/file/location/message is ~0% while duration (single short span) hits
+100%. Span F1 is unstable across epochs (0.18-0.31), the signature of
+periodically re-entering the all-`O` local minimum. Raising slot-loss weight
+(`--slot-w 4.0`) degraded intent to 76-81% without fixing spans; raising
+capacity (d=256/L=3, 1.89M) gave a noisy 0.31 peak but no stable gain.
+
+**Next levers:** CRF/structured slot loss to enforce valid BIO transitions,
+self-attention over slot head or a dedicated slot decoder, larger
+pretrained-backed encoder, or accept intent-only (UNAVAILABLE fallback for
+low-confidence slot extraction). See NEXT.md V4 section.
+
+Relevant files: `v4_model.py`, `v4_train.py`, `v4_data.py`, `v4_decompose.py`,
+`v4_eval.py`, `v4_inspect.py`. Data is gitignored; rerun `v4_data.py` /
+`v4_decompose.py` to regenerate. Eval note: must tokenize with the vocab
+built from train rows (word ids differ by frequency ordering) or load yields
+random results.
+
+---
+
 ## Where things stand
 
 The **full student-training pipeline is built and runs end-to-end**, but the
@@ -235,3 +282,5 @@ These are regenerable and excluded from git (see `.gitignore`):
 `corpus.py`, `dsl.py`, `serialize.py`, `model.py`, `train_student.py`,
 `train_teacher.py`, `paraphrase.py`, `eval.py`, `eval_required.py`,
 `intent_only.py`, `mid-training-eval.py`, `export.py`, `fsm.h`, `fsm.c`.
+V4 branch adds: `v4_model.py`, `v4_train.py`, `v4_data.py`,
+`v4_decompose.py`, `v4_eval.py`, `v4_inspect.py`, `intent_atomic.py`.
