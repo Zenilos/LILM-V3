@@ -8,45 +8,37 @@ This is a working plan, not a design doc. It picks up after commit `0cd1536`
 
 ---
 
-## V5 — drop file/object, merge recipient→person (current work, on branch `V5`)
+## V5 — drop file/object, merge recipient→person (COMPLETE)
 
-Branch `V5` was created from `V4`'s CRF commit (`873e6b9`). **No V5 code
-changes made yet.** Full detail (files to edit, commands, rationale) is in the
-STATUS.md "V5 branch — drop file/object, merge recipient→person (HANDOFF)"
-section. Abbreviated here:
+Schema simplification shipped (see STATUS.md V5 section for full detail and
+numbers). Retrained CRF model at `checkpoints/v5crf/best.npz`:
 
-The V4 CRF slot head roughly doubled span F1 (0.264→~0.52) and lifted value
-extraction location 5%→90%, message 0%→38%, person 14%→34% — **but `file` and
-`object` stayed at 0% in every run**. User decision: stop chasing those
-families; simplify the schema instead.
+- intent_acc **99.996%**, span F1 **0.769**, duration 100% / location 85% /
+  message 62% / person 37% (measured batched/padded like training).
+- Ranking up from V4 intent 85.9% / span F1 ~0.5.
 
-**The change:**
-- **PLAY**: drop `file` → intent-only (no slots).
-- **HANDOVER**: drop `object`, and merge `recipient` → `person` (both were
-  already the same "who" downstream).
-- **Object** deleted entirely.
-- Result families: `location`, `person`, `message`, `duration` only →
-  `SLOT_LABELS` = 1 + 2×4 = **9** BIO tags (was 15).
+### BLOCKER — model is not length-invariant (padding leak)
 
-**Next steps (task order):**
-1. Edit schema: `dsl.py` `SLOTS` (PLAY `()`, HANDOVER `optional ("person")`),
-   `ALL_SLOTS` (drop object/recipient/file), `SLOT_DESC`.
-2. Edit templates: `corpus.py` PLAY (slot-less) + HANDOVER (object-less,
-   `person` instead of `recipient`) templates + entity pools.
-3. Edit labels: `v4_model.py` `SLOT_LABELS` (→ 4 families, 9 classes);
-   `v4_train.py` / `v4_eval.py` `SLOT_FAMILY` (drop file/object/recipient).
-4. Regenerate data: `v4_decompose.py` → `v4_data.py` (train 64k / val 2035)
-   with the new schema; rebuild vocab from new train rows.
-5. Retrain with CRF: `v4_train.py --use-crf --wd 0.01 --score-norm`
-   d=192/L=2, 14 epochs → `checkpoints/v5crf/` (best checkpoint saved).
-6. Evaluate: `v4_eval.py --use-crf` on V5 val; compare intent / span-F1 /
-   per-family value extraction vs V4 CRF.
-7. Optional after: semantic embedding init (`build_embed_init.py` + qwen
-   word-category embeddings) if person/message still under-detected.
-8. Commit V5 results; update STATUS.md / NEXT.md V5 sections.
+`v4_eval.py` (unpadded, natural-length single utterances = the on-device case)
+reports only **20% STOP / 89% intent**. Root cause: unmasked bidirectional
+attention lets padding (id 0) tokens leak positional signal into real tokens.
+"stop" unpadded → SHOW; padded → STOP. Must mask attention over padding and
+retrain so unpadded == padded. **This is the deployment-correctness fix.**
 
-**Expected outcome:** intent recovers toward 85%+ (from the score-norm best-
-checkpoint ~79%) while slots hold on the 4 families the CRF provably handles.
+### Next steps (in order)
+
+1. **Attention-mask fix.** Thread a key-padding mask into `Attention`
+   (`pad_mask [B,1,1,T]`, `-1e4` where padding) so the model is length-
+   invariant. Thread through `Block`/`V4Model.__call__`. Retrain CRF; verify
+   unpadded ("stop" alone) == padded prediction. Re-run `v4_eval.py` — it
+   should then match the ~100% batched figure, giving the honest on-device
+   number.
+2. **Chain → sentence decomposition.** After the fix, add the capability to
+   break a multi-action chain ("go to kitchen and clean it") into separate
+   atomic sentences, each of which the (now length-invariant) atomic model can
+   classify. (Top-level plan item; design TBD — see below.)
+3. Optional: semantic embedding init (`build_embed_init.py`) if person/message
+   under-detection persists.
 
 ---
 

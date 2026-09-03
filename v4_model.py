@@ -29,7 +29,7 @@ INTENT_TO_ID = {i: k for k, i in enumerate(INTENTS)}
 
 # shared BIO tag space by slot name (one intent uses each slot family cleanly)
 SLOT_LABELS = ["O"]
-for slot in ["location", "person", "object", "recipient", "message", "file", "duration"]:
+for slot in ["location", "person", "message", "duration"]:
     SLOT_LABELS += [f"B-{slot}", f"I-{slot}"]
 SLOT_TO_ID = {l: k for k, l in enumerate(SLOT_LABELS)}
 N_SLOT_CLASSES = len(SLOT_LABELS)

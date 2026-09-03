@@ -60,30 +60,6 @@ POOLS = {
             "mr. chavez", "priya", "the caretaker",
         ],
     },
-    "object": {
-        "train": [
-            "the cup", "the red ball", "my keys", "the remote", "the plant",
-            "my phone", "the towel", "the blue box", "my glasses", "the newspaper",
-            "the scissors", "the book", "the pillow", "the mug", "the charger",
-            "the hat", "the scarf", "the umbrella", "the water bottle",
-            "my wallet", "the tablet", "the speaker", "the chess set", "the candle",
-        ],
-        "val": [
-            "the thermos", "my headphones", "the watering can", "the telescope",
-            "the skateboard", "the lantern", "the toolbox",
-        ],
-    },
-    "file": {
-        "train": [
-            "song.mp3", "alarm.wav", "chime.mp3", "birthday.mp3", "beep.wav",
-            "lullaby.wav", "focus.mp3", "rain.wav", "guitar.mp3", "news.mp3",
-            "gong.wav", "melody.mp3", "ambient.wav", "drums.wav", "serenade.mp3",
-            "warriors.mp3", "chimes.wav", "piano.mp3", "buzz.wav", "hymn.mp3",
-        ],
-        "val": [
-            "divertimento.mp3", "nocturne.wav", "fanfare.mp3", "harp.wav",
-        ],
-    },
     "message": {
         "train": [
             "dinner is ready", "time to go", "i am busy", "the door is open",
@@ -163,11 +139,11 @@ for i, p in enumerate(["clean up", "start cleaning", "vacuum in here", "clean th
     _t(f"cleanh{i}", p, "CLEAN", {"location": "@here"})
 _t("cleane0", "clean the whole house", "CLEAN", {"location": "@everywhere"})
 
-# PLAY
-for i, p in enumerate(["play {file}", "put on {file}", "play the file {file}",
-                       "start playing {file}", "give me {file}", "cue up {file}",
-                       "turn on {file}", "play {file} for me"]):
-    _t(f"play{i}", p, "PLAY", {"file": "file"})
+# PLAY (slot-less)
+for i, p in enumerate(["play music", "put on some music", "start playing music",
+                       "play something", "cue up some music", "turn on the music",
+                       "play a song", "start the music", "play"]):
+    _t(f"play{i}", p, "PLAY", {})
 
 # SHOW
 for i, p in enumerate(["show {message}", "display {message}", "put {message} on the screen",
@@ -177,16 +153,16 @@ for i, p in enumerate(["tell {person} {message}", "let {person} know {message}",
                        "show {person} {message}", "please tell {person} {message}"]):
     _t(f"showp{i}", p, "SHOW", {"message": "message", "person": "person"})
 
-# HANDOVER: recipient filled ONLY for third parties.
-for i, p in enumerate(["get {object}", "bring me {object}", "fetch {object}",
-                       "pick up {object}", "can you grab {object}", "bring {object} here",
-                       "grab {object} for me", "hand me {object}", "snag {object}",
-                       "collect {object}", "go get {object}"]):
-    _t(f"hand{i}", p, "HANDOVER", {"object": "object"})
-for i, p in enumerate(["bring {recipient} {object}", "take {object} to {recipient}",
-                       "give {object} to {recipient}", "hand {object} to {recipient}",
-                       "pass {object} to {recipient}", "deliver {object} to {recipient}"]):
-    _t(f"handr{i}", p, "HANDOVER", {"object": "object", "recipient": "person"})
+# HANDOVER: object-less; `person` filled ONLY for third parties.
+for i, p in enumerate(["bring this to {person}", "hand this to {person}",
+                       "take it over to {person}", "pass this to {person}",
+                       "deliver this to {person}", "give this to {person}",
+                       "hand {person} this", "bring it to {person}"]):
+    _t(f"handr{i}", p, "HANDOVER", {"person": "person"})
+# Speaker is the recipient: object-less, no person slot.
+for i, p in enumerate(["bring it", "bring me that", "hand it to me", "get me that",
+                       "fetch it for me", "grab me that", "pass me it"]):
+    _t(f"hand{i}", p, "HANDOVER", {})
 
 # STOP (closed class by nature)
 for i, p in enumerate(["stop", "stop everything", "halt", "abort", "stop what you are doing",

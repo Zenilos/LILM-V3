@@ -10,9 +10,9 @@ from typing import Optional
 SLOTS = {
     "MOVE": {"required": ("location",), "optional": ("person",)},
     "CLEAN": {"required": ("location",), "optional": ()},
-    "PLAY": {"required": ("file",), "optional": ()},
+    "PLAY": {"required": (), "optional": ()},
     "SHOW": {"required": ("message",), "optional": ("person",)},
-    "HANDOVER": {"required": ("object",), "optional": ("recipient",)},
+    "HANDOVER": {"required": (), "optional": ("person",)},
     "STOP": {"required": (), "optional": ()},
     "WAIT": {"required": ("duration_amount", "duration_unit"), "optional": ()},
     "UNAVAILABLE": {"required": (), "optional": ()},
@@ -33,9 +33,6 @@ SLOT_ORDER = {
 
 ALL_SLOTS = (
     "location",
-    "object",
-    "recipient",
-    "file",
     "duration_amount",
     "duration_unit",
     "message",
@@ -47,9 +44,9 @@ ALL_SLOTS = (
 INTENT_DESC = {
     "MOVE": "go to a place",
     "CLEAN": "vacuum/mop a place",
-    "PLAY": "play an sdcard file",
+    "PLAY": "play music",
     "SHOW": "display a message",
-    "HANDOVER": "fetch an object, optionally handing it to someone",
+    "HANDOVER": "bring/hand something to a person",
     "STOP": "halt everything",
     "WAIT": "pause for a duration",
     "UNAVAILABLE": "command not understood or not doable",
@@ -57,10 +54,7 @@ INTENT_DESC = {
 
 SLOT_DESC = {
     "location": "place: kitchen, my room, here, garage, where I cook",
-    "object": "physical thing: cup, red ball, the plant",
-    "recipient": "third party the object goes to: John, my wife, the kids. Omit when the speaker is the recipient",
-    "person": "person referred to: the navigation referent for MOVE, the addressee for SHOW",
-    "file": "sdcard filename: song.mp3, alarm.wav",
+    "person": "person referred to: the navigation referent for MOVE, the addressee for SHOW, the recipient for HANDOVER",
     "duration_amount": "how long to wait, numeric value",
     "duration_unit": "unit for duration_amount",
     "message": "text to display",
@@ -322,17 +316,17 @@ if __name__ == "__main__":
                               Action("SHOW", {"message": "dinner is ready"}))
 
     # --- HANDOVER (merged GET/GIVE) ---------------------------------------
-    assert action_matches(Action("HANDOVER", {"object": "cup"}),
-                          Action("HANDOVER", {"object": "the cup"}))
-    assert action_matches(Action("HANDOVER", {"object": "cup", "recipient": "John"}),
-                          Action("HANDOVER", {"object": "cup", "recipient": "john"}))
+    assert action_matches(Action("HANDOVER", {}),
+                          Action("HANDOVER", {}))
+    assert action_matches(Action("HANDOVER", {"person": "John"}),
+                          Action("HANDOVER", {"person": "john"}))
     # "bring me the cup": speaker is the recipient, so the slot stays empty
-    assert action_matches(Action("HANDOVER", {"object": "cup"}),
-                          Action.from_dict({"intent": "HANDOVER", "slots": {"object": "cup"}}))
+    assert action_matches(Action("HANDOVER", {}),
+                          Action.from_dict({"intent": "HANDOVER", "slots": {}}))
     # legacy GET/GIVE labels migrate on load
-    assert Action.from_dict({"intent": "GET", "slots": {"object": "cup"}}).intent == "HANDOVER"
+    assert Action.from_dict({"intent": "GET", "slots": {}}).intent == "HANDOVER"
     assert Action.from_dict({"intent": "GIVE",
-                             "slots": {"object": "cup", "recipient": "John"}}).intent == "HANDOVER"
+                             "slots": {"person": "John"}}).intent == "HANDOVER"
 
     # --- plan-level rules --------------------------------------------------
     validate_plan([Action("UNAVAILABLE", {})])
@@ -350,16 +344,14 @@ if __name__ == "__main__":
     assert not actions_match([], [Action("UNAVAILABLE", {})])
 
     # --- structural validation --------------------------------------------
-    for bad in (lambda: Action("PLAY", {}),
-                lambda: Action("CLEAN", {}),
-                lambda: Action("HANDOVER", {}),
+    for bad in (lambda: Action("CLEAN", {}),
                 lambda: Action("STOP", {"location": "kitchen"}),
                 lambda: Action("UNAVAILABLE", {"location": "kitchen"}),
                 lambda: Action("MOVE", {"location": "here", "recipient": "John"}),
                 lambda: Action("WAIT", {"duration_amount": "5", "duration_unit": "fortnights"}),
                 lambda: Action("WAIT", {"duration_amount": "-3", "duration_unit": "seconds"}),
                 lambda: Action("WAIT", {"duration_amount": "soon", "duration_unit": "seconds"}),
-                lambda: Action("WAKEUP", {"recipient": "John"}),
+                lambda: Action("WAKEUP", {"person": "John"}),
                 lambda: Action("GET", {"object": "cup"})):
         try:
             bad()
@@ -371,7 +363,8 @@ if __name__ == "__main__":
     assert all(len(SLOTS[i]["optional"]) <= 1 for i in INTENTS), \
         "FSM assumes at most one optional slot per intent"
     assert INTENTS == tuple(SLOTS)
-    assert SLOT_ORDER["HANDOVER"] == ("object", "recipient")
+    assert SLOT_ORDER["HANDOVER"] == ("person",)
+    assert SLOT_ORDER["PLAY"] == ()
     assert [i for i in INTENTS if SLOTS[i]["optional"]] == ["MOVE", "SHOW", "HANDOVER"]
     assert max(len(SLOT_ORDER[i]) for i in INTENTS) == 2, "FSM value-slot budget"
 

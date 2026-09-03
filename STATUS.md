@@ -8,95 +8,68 @@ the concrete next steps. It is the working record for the solo session; see
 
 ---
 
-## V5 branch — drop file/object, merge recipient→person (HANDOFF)
+## V5 branch — drop file/object, merge recipient→person (COMPLETE + finding)
 
-Branch `V5` was created from `V4` after the CRF results below. **No V5 code
-changes have been made yet** — this section is the resume point.
+Branch `V5` implemented the schema simplification: PLAY became intent-only,
+HANDOVER dropped `object` and merged `recipient` → `person`, and `object`/
+`file` were deleted. Final families: `location`, `person`, `message`,
+`duration` → `SLOT_LABELS` = 9 BIO tags (was 15).
 
-### The change (decided by user, partially in progress)
+### V5 results (retrained with CRF, d=192/L=2, 707k params, 14 epochs)
 
-Simplify the slot schema so the model only has to extract slots the CRF is
-already good at, rather than burning capacity on families it gets 0% on:
+`checkpoints/v5crf/best.npz`, measured with the same **batched/padded**
+inference as training (`v4_train.evaluate`):
 
-- **PLAY**: drop the `file` slot → PLAY becomes intent-only (no slots).
-- **HANDOVER**: drop the `object` slot AND merge `recipient` → `person`.
-  After the merge, `person` is the single "who" family shared by MOVE (opt),
-  SHOW (opt), and HANDOVER (opt). HANDOVER becomes object-less: "hand/take
-  this to John".
-- **Object** itself is deleted entirely (as requested).
+| metric | value |
+|---|---|
+| **intent_acc** | **47817/47819 = 99.996%** |
+| slot token acc | 0.915 |
+| span F1 | 0.769 |
+| value extraction | duration 100%, location 85%, message 62%, person 37% |
 
-New target schema (families): `location`, `person`, `message`, `duration`.
-NOTHING else. `SLOT_LABELS` then has 1 + 2*4 = **9** BIO tags
-(`O, B/I-(location,person,message,duration)`) instead of 15.
+This is a dramatic jump from V4 (intent 85.9%, span F1 ~0.5, location 5%
+without CRF): dropping the 0%-capable families (file/object) let the model
+focus and it now extracts all four remaining families.
 
-### Files to change (all verified current as of V5 base)
+### CRITICAL finding — model is NOT length-invariant (padding leak)
 
-1. `dsl.py`
-   - `SLOTS`: `PLAY → {"required": (), "optional": ()}`;
-     `HANDOVER → {"required": (), "optional": ("person",)}`.
-   - `ALL_SLOTS`: drop `object`, `recipient`, `file`. Keep
-     `location, duration_amount, duration_unit, message, person`.
-   - `SLOT_DESC`: drop object/recipient/file prose; fold recipient prose into
-     person ("third party the object goes to: John, my wife, the kids").
-2. `corpus.py`
-   - PLAY templates (`_t(f"play{i}", ...)`, ~line 167) currently fill
-     `{file}`; must produce slot-less utterances (e.g. "play music", "start
-     playing", "cue up a song"). Remove the PLAY file-entity usage.
-   - HANDOVER templates (~line 186) currently fill object+recipient; must
-     become object-less and use `{"person": "person"}` instead of
-     `recipient` (e.g. "bring this to {person}", "hand this to {person}",
-     "take it over to {recipient/person}"). Remove object-entity usage.
-   - Check `_t` uses `action={"intent": ..., "slots": {...}}` — ensure the
-     slots dict uses `person` for HANDOVER now.
-3. `v4_model.py`
-   - The `for slot in [...]` that builds `SLOT_LABELS` (~line 32) → remove
-     `object`, `recipient`, `file`, leaving
-     `["location", "person", "message", "duration"]`. `N_SLOT_CLASSES` → 9.
-4. `v4_train.py`
-   - `SLOT_FAMILY` (~line 36): remove object/recipient/file entries.
-5. `v4_decompose.py` / `v4_data.py` — they read `SLOTS` from `dsl`, so once
-   dsl/corpus are updated the regenerate picks up the new schema
-   automatically. Verify no hardcoded family names remain.
-6. `v4_eval.py` — reads `SLOT_FAMILY`, so automatic after v4_train; no
-   file/object/recipient references should remain.
+The training-loop `v4_train.evaluate` reports ~100% intent, but `v4_eval.py`
+(which runs each row **unpadded**, natural length) reports only **20% STOP**
+and 89% overall. Root cause:
 
-### Regenerate + retrain (the actual work)
+- `stop` as a natural len-2 row → predicts **SHOW** ❌
+- `stop` padded to batch length → predicts **STOP** ✅
 
-```bash
-# 1. regenerate train/val atomic+balanced sets with the new schema
-~/p3.11/bin/python3 v4_data.py --split train --out data/v4/train_balanced.jsonl \
-   --reject-jsonl data/train_a.jsonl --n-atomic 300000 --per-intent 8000
-~/p3.11/bin/python3 v4_data.py --split val --out data/v4/val_balanced.jsonl \
-   --reject-jsonl data/train_a.jsonl --n-atomic 60000 --per-intent 8000
-# (per-intent target may need a smoke first; also still need the val-pool path
-#  that the old val was built from — check v4_decompose for the exact val cmd)
+The intent pooling mean correctly masks padding out of the *pool*, but the
+**bidirectional self-attention is NOT masked over padding**, so padding tokens
+(all id 0 = CLS/UNK) leak positional signal into the real tokens. Training
+always padded via `collate`, so the model embedded "there are pads after me";
+run unpadded (as on-device, one utterance at a time) it behaves differently.
 
-# 2. retrain with CRF (best-checkpoint saving + weight decay)
-nohup ~/p3.11/bin/python3 v4_train.py \
-  --train data/v4/train_balanced.jsonl --val data/v4/val_balanced.jsonl \
-  --out checkpoints/v5 --d 192 --layers 2 --heads 4 --head-dim 32 --ffn 384 \
-  --epochs 14 --batch 256 --lr 3e-3 --slot-w 1.5 --use-crf --wd 0.01 --score-norm \
-  > logs/v5.log 2>&1 &
+**Implication:** on-device single-utterance inference (like `v4_eval`) is the
+deployment case, and the model fails it. The `v4_eval.py` ~20% STOP is the
+*honest deployment-case* number. **Fix required: mask attention over padding**
+(thread a key-padding mask into `Attention`) so the model is invariant to
+sequence length, then retrain and re-verify unpadded == padded. Deferred to
+the "attention-mask fix" step after this commit.
 
-# 3. eval the saved best checkpoint
-~/p3.11/bin/python3 v4_eval.py --ckpt checkpoints/v5/best.npz \
-  --use-crf --train data/v4/train_balanced.jsonl --val data/v4/val_balanced.jsonl
-```
+### The work (committed here)
 
-### Why this should help
-
-The CRF already lifts span F1 ~0.26→~0.5 and value extraction location
-5%→90%, message 0%→38%, person 14%→34%. The two families that stayed at
-**0% were exactly `file` and `object`** — the ones the user chose to drop.
-`recipient` and `person` extract similarly (both "who"), so merging removes
-a confusing split-BIO family (they were downstream-identical already). After
-V5 the model only tags location/person/message/duration — all families where
-the CRF head demonstrably works — so the weak-on-empty-slot problem disappears
-and intent (which the score-norm best-checkpoint trades force down) should
-recover toward 85%+ while slots hold.
+1. `dsl.py` — `SLOTS`: PLAY `()` , HANDOVER `optional ("person")`; `ALL_SLOTS`
+   drops object/recipient/file; `SLOT_DESC` folds recipient→person; `INTENT_DESC`
+   updated; `SLOT_ORDER["HANDOVER"]==("person",)`; tests updated.
+2. `corpus.py` — PLAY templates slot-less; HANDOVER object-less with
+   `person`+speaker variants; removed `object`/`file` entity pools.
+3. `v4_model.py` — `SLOT_LABELS` → `["location","person","message","duration"]`
+   (N_SLOT_CLASSES 15→9).
+4. `v4_train.py` / `v4_eval.py` — `SLOT_FAMILY` drops object/recipient/file
+   (v4_eval auto-adapts).
+5. `v4_data.py` — fixed missing `collections` import (pre-existing latent bug
+   that would crash `main()`).
+6. Regenerated balanced data (train 61k / val 47.8k rows, 9 BIO tags) and
+   retrained `checkpoints/v5crf/`.
 
 ---
-
 ## V4 branch — joint intent + slot-tagger pivot (atomic commands)
 
 The generative end-to-end FSM student ceilings at ~7-8% even intent-only

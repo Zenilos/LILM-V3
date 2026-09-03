@@ -36,10 +36,7 @@ SLOT_W_CAP = 4.0
 SLOT_FAMILY = {
     "location": "location",
     "person": "person",
-    "object": "object",
-    "recipient": "recipient",
     "message": "message",
-    "file": "file",
     "duration_amount": "duration",
     "duration_unit": "duration",
 }
