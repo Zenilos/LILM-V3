@@ -31,29 +31,47 @@ This is a dramatic jump from V4 (intent 85.9%, span F1 ~0.5, location 5%
 without CRF): dropping the 0%-capable families (file/object) let the model
 focus and it now extracts all four remaining families.
 
-### CRITICAL finding — model is NOT length-invariant (padding leak)
+### CRITICAL finding — model is NOT length-invariant (padding leak) — FIXED
 
-The training-loop `v4_train.evaluate` reports ~100% intent, but `v4_eval.py`
-(which runs each row **unpadded**, natural length) reports only **20% STOP**
-and 89% overall. Root cause:
+The pre-fix training-loop `v4_train.evaluate` reported ~100% intent, but
+`v4_eval.py` (each row **unpadded**, natural length = the on-device case)
+reported only **20% STOP** and 89% overall. Root cause and fix:
 
-- `stop` as a natural len-2 row → predicts **SHOW** ❌
-- `stop` padded to batch length → predicts **STOP** ✅
+- **Root cause:** intent pooling masks padding out of the *pool*, but the
+  bidirectional self-attention was NOT masked over padding, so padding tokens
+  (all id 0 = CLS/UNK) leaked positional signal into the real tokens. Training
+  always padded via `collate`, so the model embedded "there are pads after me";
+  run unpadded (one utterance at a time, as on-device) it behaved differently.
+  `"stop"` unpadded → SHOW; padded → STOP.
+- **Fix (v4_model.py):** threaded a key-padding mask through
+  `Attention.__call__` / `Block.__call__` / `V4Model.__call__`, applying
+  `-1e4` to attention scores over padding keys (`pad_mask [B,1,1,T]`). The
+  model is now **length-invariant**: verified unpadded forward == padded
+  forward (logit diff = 0.0).
 
-The intent pooling mean correctly masks padding out of the *pool*, but the
-**bidirectional self-attention is NOT masked over padding**, so padding tokens
-(all id 0 = CLS/UNK) leak positional signal into the real tokens. Training
-always padded via `collate`, so the model embedded "there are pads after me";
-run unpadded (as on-device, one utterance at a time) it behaves differently.
+### V5 results AFTER the attention-mask fix (honest, consistent)
 
-**Implication:** on-device single-utterance inference (like `v4_eval`) is the
-deployment case, and the model fails it. The `v4_eval.py` ~20% STOP is the
-*honest deployment-case* number. **Fix required: mask attention over padding**
-(thread a key-padding mask into `Attention`) so the model is invariant to
-sequence length, then retrain and re-verify unpadded == padded. Deferred to
-the "attention-mask fix" step after this commit.
+Retrained CRF with masking → `checkpoints/v5crf_mask/best.npz`. Both the
+batched (training-style) and unpadded (`v4_eval`) measurements now **agree
+exactly per-intent** — full length-invariance confirmed. Honest numbers:
 
-### The work (committed here)
+| metric | value |
+|---|---|
+| **intent_acc** | **90.2%** (STOP 100, CLEAN 100, PLAY 100, WAIT 100, HANDOVER 96, SHOW 86, MOVE 58) |
+| span F1 | 0.630 |
+| value extraction | duration 100%, message 74.5%, person 44.6%, location 32.3% |
+
+**The previous ~100% was inflated** by the padding leak; ~90% is the honest
+capability. The gap (esp. location 32.3%, MOVE 58%) is dominated by **OOD
+generalization**: the val split is deliberately seen-never (held-out entities
+& templates). MOVE's val utterances ("go to the conservatory", "roll to the
+annexe") use wholly novel surface forms, so a small from-scratch model can't
+generalize them — it over-predicts HANDOVER. This is documented OOD behavior,
+not a training bug.
+
+---
+
+
 
 1. `dsl.py` — `SLOTS`: PLAY `()` , HANDOVER `optional ("person")`; `ALL_SLOTS`
    drops object/recipient/file; `SLOT_DESC` folds recipient→person; `INTENT_DESC`

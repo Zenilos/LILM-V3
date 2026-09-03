@@ -81,7 +81,11 @@ class Attention(nn.Module):
         self.v = nn.Linear(d, n_heads * head_dim)
         self.o = nn.Linear(n_heads * head_dim, d)
 
-    def __call__(self, x, cos, sin):
+    def __call__(self, x, cos, sin, pad_mask=None):
+        """pad_mask: [B, T] with 1 for real tokens, 0 for padding. Bidirectional
+        attention is masked so padding tokens neither attend nor are attended to;
+        this makes the model invariant to sequence length (a single unpadded
+        utterance gives the same logits as the same utterance padded in a batch)."""
         B, T, _ = x.shape
         q = self.q(x).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.k(x).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -89,6 +93,10 @@ class Attention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         attn = (q @ k.transpose(0, 1, 3, 2)) * self.scale
+        if pad_mask is not None:
+            # [B,1,1,T]: attend only to real tokens (keys); forbid padding keys
+            km = pad_mask[:, None, None, :]
+            attn = mx.where(km > 0, attn, -1e4)
         attn = mx.softmax(attn, axis=-1)
         out = attn @ v
         out = out.transpose(0, 2, 1, 3).reshape(B, T, self.n_heads * self.head_dim)
@@ -115,8 +123,8 @@ class Block(nn.Module):
         self.attn = Attention(d, n_heads, head_dim)
         self.ffn = FFN(d, ffn)
 
-    def __call__(self, x, cos, sin):
-        x = x + self.attn(self.attn_norm(x), cos, sin)
+    def __call__(self, x, cos, sin, pad_mask=None):
+        x = x + self.attn(self.attn_norm(x), cos, sin, pad_mask)
         x = x + self.ffn(x)
         return x
 
@@ -249,12 +257,12 @@ class V4Model(nn.Module):
         Token 0 of each row is a [CLS] marker used for intent pooling."""
         B, T = x.shape
         h = self.embedding(x)
-        for blk in self.blocks:
-            h = blk(h, self.cos, self.sin)
-        h = self.final_norm(h)
-        # intent: mean-pool over non-padding tokens (CLS + utterance)
         if mask is None:
             mask = mx.ones((B, T))
+        for blk in self.blocks:
+            h = blk(h, self.cos, self.sin, mask)
+        h = self.final_norm(h)
+        # intent: mean-pool over non-padding tokens (CLS + utterance)
         mask = mask[..., None]
         pooled = (h * mask).sum(axis=1) / mx.maximum(mask.sum(axis=1), 1.0)
         intent_logits = self.intent_head(pooled)
