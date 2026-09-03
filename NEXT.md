@@ -34,38 +34,26 @@ retrain so unpadded == padded. **This is the deployment-correctness fix.**
    `v4_eval` (unpadded) and batched now agree exactly per-intent. The earlier
    ~100% was a padding-leak inflation. Remaining gap is OOD generalization
    (val uses held-out entities/templates; MOVE over-predicts HANDOVER).
-2. **Chain → sentence decomposition.** Break a multi-action chain ("go to the
-   kitchen and clean it", "head to my desk, pick that up, then wait") into
-   separate atomic sentences, each fed to the (now length-invariant) atomic
-   model. This is the top-level goal after V5. Design is TBD — see below.
+2. **DONE — Chain → sentence decomposition (approach A).** `chain_seg.py`
+   breaks a chain into atomic sentences gold-free (connectives + anaphora
+   resolution), each fed to the V5 model. End-to-end: seg-count 93.7%,
+   intent/clause 95.9%, intent+slots 91.2%; **model-only 98.2% intent / 94.5%
+   intent+slots** on correctly-segmented clauses. **Approach B (learned
+   boundary model) NOT needed** — remaining failures are corpus bare-space
+   joins and a comma-appositive template, not realistic or boundary-learnable.
+   Revisit B only if real deployments show unseen boundaries. See STATUS.md
+   Chain section.
 3. Optional: semantic embedding init (`build_embed_init.py`) if person/message
    /location under-detection persists.
 
-### Chain → sentence decomposition (design sketch, task 2)
+### Chain → sentence decomposition — RESOLVED (approach A)
 
-Goal: given a spoken chain (2-3 atomic actions joined by connectives /
-implicit coreference), produce N atomic sentences, one per action, so each can
-be classified by the V5 atomic intent+slot model.
-
-Two candidate approaches:
-
-- **A. Symbolic segmenter (no learned decomposition):** reuse the existing
-  `corpus.py` chain grammar (connective tokens `and/and then/then/,/, then/,
-  after that/also`, plus anaphora "it"/"this" resolving to the previous
-  action's location). Split on known connectives and restore dropped anaphora
-  by copying the referent slot. Deterministic, zero extra capacity, but only
-  works for chains whose structure the grammar covers. Leverages the existing
-  `v4_decompose.py` (chain→atomic) which already alignment-verified 0
-  mismatches.
-- **B. Learned sentence-boundary / span model:** a second tiny head or model
-  that predicts action boundaries (each action → its token span), then each
-  span is classified. More general (unseen connectives) but needs new labelled
-  data and capacity.
-
-Recommend A first (free via `v4_decompose.py` + the atomic V5 model), then
-only pursue B if real deployments produce chains the grammar can't segment.
-Verify by regenerating pair/triple chains → decompose to atomic → run each
-atomic through the V5 model → confirm each intent+slot is correct.
+Approach A (symbolic splitter) implemented and validated — see STATUS.md.
+Approach B (learned sentence-boundary model) evaluated and **declined**:
+connective set is effectively closed, model-only clause accuracy is ~98%, and
+the only segmentation gaps are corpus artifacts / a comma-appositive template
+that a learned boundary head would not robustly fix. Reconsider only with real
+deployment evidence of unseen connectives.
 
 ---
 

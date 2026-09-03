@@ -8,7 +8,7 @@ the concrete next steps. It is the working record for the solo session; see
 
 ---
 
-## V5 branch — drop file/object, merge recipient→person (COMPLETE + finding)
+## V5 — drop file/object, merge recipient→person (COMPLETE + finding)
 
 Branch `V5` implemented the schema simplification: PLAY became intent-only,
 HANDOVER dropped `object` and merged `recipient` → `person`, and `object`/
@@ -88,6 +88,42 @@ not a training bug.
    retrained `checkpoints/v5crf/`.
 
 ---
+
+## Chain → sentence segmentation (approach A, DONE)
+
+`chain_seg.py` breaks a spoken multi-action chain into standalone atomic
+sentences WITHOUT gold labels, each fed to the (now length-invariant) V5 model.
+
+Splits on connectives (`and`, `and then`, `then`, `also`, commas, periods,
+semicolons — longest first), strips leading bare connectives, resolves
+anaphora ("it"/"this"/"that" → most recent location/person, "here" → referent).
+
+**End-to-end verification** (`chain_eval.py`, 600 corpus chains, gold-free
+segmentation → decompose → classify each clause with `v5crf_mask/best.npz`):
+
+| metric | value |
+|---|---|
+| segmentation count correct | 93.7% |
+| intent / clause | 95.9% |
+| intent + slots / clause | 91.2% |
+| **model-only intent** (on correctly-segmented) | **98.2%** |
+| **model-only intent + slots** | **94.5%** |
+
+**Decision: approach B NOT needed.** The remaining segmentation failures are
+(i) corpus bare-space joins — degenerate concatenation with no connective word
+("travel to the utility room make your way to the greenhouse"), not realistic
+spoken input; and (ii) appositive relative clauses from a movep template
+("go to mia, she is at my desk" — one MOVE, my segmenter over-splits at the
+comma). Neither is helped by a learned boundary model; the connective set is
+closed and model-only accuracy is already ~98%. Revisit B only if a real
+deployment surfaces unseen boundaries.
+
+Self-test: `~/p3.11/bin/python3 chain_seg.py` (10 cases, all pass).
+Eval: `~/p3.11/bin/python3 chain_eval.py --ckpt checkpoints/v5crf_mask/best.npz`
+
+---
+
+
 ## V4 branch — joint intent + slot-tagger pivot (atomic commands)
 
 The generative end-to-end FSM student ceilings at ~7-8% even intent-only
