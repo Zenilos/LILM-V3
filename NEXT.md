@@ -1,6 +1,6 @@
 # NEXT.md — What to do now
 
-_Last updated: 2026-09-02_
+_Last updated: 2026-09-03_
 
 This is a working plan, not a design doc. It picks up after commit `0cd1536`
 (all bug fixes, scheduled sampling, KD, model.py reconciliation) and the
@@ -8,7 +8,49 @@ This is a working plan, not a design doc. It picks up after commit `0cd1536`
 
 ---
 
-## V4 — joint intent + slot-tagger (current work, on branch `V4`)
+## V5 — drop file/object, merge recipient→person (current work, on branch `V5`)
+
+Branch `V5` was created from `V4`'s CRF commit (`873e6b9`). **No V5 code
+changes made yet.** Full detail (files to edit, commands, rationale) is in the
+STATUS.md "V5 branch — drop file/object, merge recipient→person (HANDOFF)"
+section. Abbreviated here:
+
+The V4 CRF slot head roughly doubled span F1 (0.264→~0.52) and lifted value
+extraction location 5%→90%, message 0%→38%, person 14%→34% — **but `file` and
+`object` stayed at 0% in every run**. User decision: stop chasing those
+families; simplify the schema instead.
+
+**The change:**
+- **PLAY**: drop `file` → intent-only (no slots).
+- **HANDOVER**: drop `object`, and merge `recipient` → `person` (both were
+  already the same "who" downstream).
+- **Object** deleted entirely.
+- Result families: `location`, `person`, `message`, `duration` only →
+  `SLOT_LABELS` = 1 + 2×4 = **9** BIO tags (was 15).
+
+**Next steps (task order):**
+1. Edit schema: `dsl.py` `SLOTS` (PLAY `()`, HANDOVER `optional ("person")`),
+   `ALL_SLOTS` (drop object/recipient/file), `SLOT_DESC`.
+2. Edit templates: `corpus.py` PLAY (slot-less) + HANDOVER (object-less,
+   `person` instead of `recipient`) templates + entity pools.
+3. Edit labels: `v4_model.py` `SLOT_LABELS` (→ 4 families, 9 classes);
+   `v4_train.py` / `v4_eval.py` `SLOT_FAMILY` (drop file/object/recipient).
+4. Regenerate data: `v4_decompose.py` → `v4_data.py` (train 64k / val 2035)
+   with the new schema; rebuild vocab from new train rows.
+5. Retrain with CRF: `v4_train.py --use-crf --wd 0.01 --score-norm`
+   d=192/L=2, 14 epochs → `checkpoints/v5crf/` (best checkpoint saved).
+6. Evaluate: `v4_eval.py --use-crf` on V5 val; compare intent / span-F1 /
+   per-family value extraction vs V4 CRF.
+7. Optional after: semantic embedding init (`build_embed_init.py` + qwen
+   word-category embeddings) if person/message still under-detected.
+8. Commit V5 results; update STATUS.md / NEXT.md V5 sections.
+
+**Expected outcome:** intent recovers toward 85%+ (from the score-norm best-
+checkpoint ~79%) while slots hold on the 4 families the CRF provably handles.
+
+---
+
+## V4 — joint intent + slot-tagger (DONE, superseded by V5)
 
 The generative FSM student can't learn semantic roles. On `V4` we switched to a
 joint intent + BIO slot-tagging model over **atomic** commands. Status:
@@ -16,33 +58,19 @@ joint intent + BIO slot-tagging model over **atomic** commands. Status:
 - **Intent works: 85.9% atomic intent** (STOP 100%, WAIT 99%, SHOW 96%,
   MOVE 89%; weak spots PLAY 62%, HANDOVER 71%). Model = 879k params,
   d=192/L=2, 64k balanced rows. This is the branch's win.
-- **Slot extraction does NOT work:** object/file ≈ 0%, location 5%, message 4%;
-  only duration 100%. Slot head collapses to predicting `O`. Span F1 ~0.19-0.31
-  and unstable. Class-weight + slot-loss changes didn't fix it; bigger model
-  gave a noisy 0.31 peak.
-
-### Next steps to fix the slot head (in rough priority)
-
-1. **Structured/CRF slot head.** The BIO sequence has hard constraints
-   (no `I-` without preceding `B-`/`I-` same family; one span per slot). A CRF
-   or constrained decoding pass would stop the all-`O` collapse and clean up
-   span boundaries. Best ROI given the intent head already works.
-2. **Slot-aware decoding / confidence gating.** When slot extraction is low
-   confidence, return intent-only and let the robot ask / fall back — turns the
-   86% intent win into useful behavior today.
-3. **Dedicated slot decoder** (or copy tag-family info into the slot head via
-   the intent embedding) to help spans follow the predicted intent.
-4. If a strong slot model is required and on-device budget allows, revisit a
-   larger or pre-trained-backed encoder (offline distillation, NEXT.md Path B).
+- **CRF slot head (the chosen fix) is DONE:** span F1 ~0.26→~0.52, value
+  extraction location 5%→90%, message 0%→38%, person 14%→34%. Committed as
+  `873e6b9`. Remaining zero-families (file/object) drove the V5 schema change.
 
 ### Re-usable pieces
 
 `v4_decompose.py` (chain→atomic, alignment-verified), `v4_data.py` (per-intent
-balanced atomic set), `v4_model.py` / `v4_train.py` (trainer with class-weighted
-slot loss + span-F1 eval), `v4_eval.py` (per-intent + per-family value
-extraction using the train-built vocab).
+balanced atomic set), `v4_model.py` / `v4_train.py` (trainer with CRF slot
+loss + `--use-crf/--wd/--score-norm/--embed-init`, best-checkpoint saving),
+`v4_eval.py` (per-intent + per-family value extraction, `--use-crf` Viterbi),
+`build_embed_init.py` (semantic-category embedding init).
 
-Docs updated: STATUS.md V4 section.
+Docs updated: STATUS.md V4 + V5 sections; NEXT.md V5 section.
 
 ---
 
