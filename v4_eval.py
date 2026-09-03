@@ -15,6 +15,7 @@ def main():
     ap.add_argument("--train", default="data/v4/train_balanced.jsonl")
     ap.add_argument("--d", type=int, default=192)
     ap.add_argument("--layers", type=int, default=2)
+    ap.add_argument("--use-crf", action="store_true")
     a = ap.parse_args()
 
     rows = [json.loads(l) for l in open(a.val)]
@@ -23,7 +24,8 @@ def main():
     bt = build_base_tok([" ".join(r["tokens"]) for r in tr], size=4096)
     w2i = bt.word2id
 
-    model = V4Model(vocab_size=len(w2i), d=a.d, n_layers=a.layers)
+    model = V4Model(vocab_size=len(w2i), d=a.d, n_layers=a.layers,
+                    use_crf=a.use_crf)
     data = np.load(a.ckpt, allow_pickle=False)
     tree = {}
     for k in data.files:
@@ -44,13 +46,13 @@ def main():
     model.update(tree)
     print("model loaded")
 
-    def decode(toks, sl_f):
+    def decode(toks, labels):
         """BIO decode into {family: [value_str...]} honoring adjacency constraints.
-        toks = raw tokens (no CLS); sl_f = [CLS] + per-token labels."""
+        toks = raw tokens (no CLS); labels = [CLS] + per-token label ids."""
         spans = collections.defaultdict(list)
         cur = None
         for j, tok in enumerate(toks):
-            lab = SLOT_LABELS[int(mx.argmax(sl_f[j + 1]))]  # skip CLS
+            lab = SLOT_LABELS[int(labels[j + 1])]  # skip CLS
             if lab == "O":
                 cur = None
                 continue
@@ -89,7 +91,11 @@ def main():
             per_intent[r["intent"]][0] += 1
         per_intent[r["intent"]][1] += 1
 
-        dec = decode(r["tokens"], sl_f[0])
+        if a.use_crf:
+            labels = model.crf.decode(sl_f, mask)[0]
+        else:
+            labels = mx.argmax(sl_f, axis=-1)[0]
+        dec = decode(r["tokens"], labels)
         # gold value tuples per family (drop O-token-only entries)
         gold = collections.defaultdict(list)
         for key, tags in r.get("slots", {}).items():

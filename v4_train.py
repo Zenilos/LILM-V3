@@ -137,7 +137,10 @@ def evaluate(model: V4Model, rows, bt, max_len: int, batch: int = 512):
         toks, m, it_gold, slots_gold = collate(chunk)
         it_logits, slot_logits = model(toks, m)
         it_pred = mx.argmax(it_logits, axis=-1)
-        slot_pred = mx.argmax(slot_logits, axis=-1)
+        if getattr(model, "use_crf", False):
+            slot_pred = model.crf.decode(slot_logits, m)
+        else:
+            slot_pred = mx.argmax(slot_logits, axis=-1)
         for i in range(toks.shape[0]):
             n += 1
             g = int(it_gold[i])
@@ -239,6 +242,12 @@ def main():
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=3e-3)
     ap.add_argument("--slot-w", type=float, default=SLOT_LOSS_W)
+    ap.add_argument("--use-crf", action="store_true")
+    ap.add_argument("--wd", type=float, default=0.01)
+    ap.add_argument("--score-norm", action="store_true",
+                    help="save best by normalized intent+spanF1 instead of last epoch")
+    ap.add_argument("--embed-init", default=None,
+                    help="npz with an 'embedding' [V,d] matrix to init the embedding")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
@@ -257,15 +266,24 @@ def main():
 
     model = V4Model(vocab_size=len(bt.word2id), d=a.d, n_layers=a.layers,
                     n_heads=a.heads, head_dim=a.head_dim, ffn=a.ffn,
-                    max_len=a.max_len)
-    print(f"vocab={len(bt.word2id)} params={_nparams(model.parameters())}")
+                    max_len=a.max_len, use_crf=a.use_crf)
+    if a.embed_init:
+        ei = np.load(a.embed_init)["embedding"]
+        model.load({"embedding.weight": mx.array(ei.astype("float32"))},
+                   strict=False)
+        print(f"embedding initialized from {a.embed_init} shape={ei.shape}")
+    print(f"vocab={len(bt.word2id)} params={_nparams(model.parameters())} "
+          f"crf={a.use_crf}")
 
-    opt = optim.AdamW(learning_rate=a.lr)
+    opt = optim.AdamW(learning_rate=a.lr, weight_decay=a.wd)
     slot_weights = compute_slot_weights(train_rows)
 
     def loss_fn(mod, toks, m, it_gold, slots_gold):
         it_logits, slot_logits = mod(toks, m)
         it_ce = nn.losses.cross_entropy(it_logits, it_gold, reduction="mean")
+        if a.use_crf:
+            sl = mod.crf.nll(slot_logits, m, slots_gold)
+            return it_ce + a.slot_w * sl
         flat = slot_logits.reshape(-1, N_SLOT_CLASSES)
         fg = slots_gold.reshape(-1)
         fm = m.reshape(-1)
@@ -280,6 +298,7 @@ def main():
     print("training...")
     os.makedirs(a.out, exist_ok=True)
     start = time.time()
+    best_score = -1.0
     for ep in range(1, a.epochs + 1):
         np.random.shuffle(train_rows)
         running = 0.0
@@ -295,10 +314,19 @@ def main():
         elapsed = time.time() - start
         print(f"[epoch {ep}/{a.epochs}] loss={running/max(1,nstep):.4f} "
               f"({elapsed:.0f}s) | val:", flush=True)
-        evaluate(model, val_rows, bt, a.max_len)
+        res = evaluate(model, val_rows, bt, a.max_len)
         state = _flatten(model.parameters())
         npz = {k: np.asarray(v) for k, v in state.items()}
-        np.savez(f"{a.out}/last.npz", **npz)
+        if a.score_norm:
+            score = 0.5 * res["intent_acc"] + 0.5 * res["span_f1"]
+            if score > best_score:
+                best_score = score
+                np.savez(f"{a.out}/best.npz", **npz)
+                print(f"  * new best score={score:.3f}", flush=True)
+        else:
+            np.savez(f"{a.out}/last.npz", **npz)
+    if a.score_norm:
+        print(f"best score={best_score:.3f}")
     print("done")
 
 

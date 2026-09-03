@@ -1,5 +1,6 @@
 # Regenerable / large artifacts (keep out of git)
 data/*.jsonl
+data/v4/
 checkpoints/
 logs/
 build/

@@ -19,6 +19,7 @@ first; quantization is a later step.
 from __future__ import annotations
 
 import math
+import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -32,6 +33,9 @@ for slot in ["location", "person", "object", "recipient", "message", "file", "du
     SLOT_LABELS += [f"B-{slot}", f"I-{slot}"]
 SLOT_TO_ID = {l: k for k, l in enumerate(SLOT_LABELS)}
 N_SLOT_CLASSES = len(SLOT_LABELS)
+
+# large finite negative used to (soft-)forbid impossible BIO transitions
+NEG = 1e4
 
 
 class RMSNorm(nn.Module):
@@ -117,18 +121,127 @@ class Block(nn.Module):
         return x
 
 
+class CRF(nn.Module):
+    """Linear-chain CRF over BIO tags.
+
+    Enforces valid BIO transitions (no I-x unless preceded by B-x / I-x of the
+    same family) so spans cannot fragment and the model cannot collapse to a
+    single pathological all-O/patchy pattern the way independent per-token
+    softmax can. `trans` is a learnable [C, C] transition matrix added to the
+    emission scores from the slot head.
+    """
+
+    def __init__(self, n_tags: int):
+        super().__init__()
+        self.n_tags = n_tags
+        self.trans = mx.zeros((n_tags, n_tags))  # trans[i, j] = score i -> j
+        names = SLOT_LABELS
+
+        def fam_of(k: int):
+            n = names[k]
+            return n[2:] if n.startswith(("B-", "I-")) else None
+
+        # hard structural mask: 0 for allowed transitions, -inf for forbidden
+        mask = np.ones((n_tags, n_tags), dtype=np.float32)
+        for dst in range(n_tags):
+            if names[dst].startswith("I-"):
+                f = names[dst][2:]
+                # only B-fam or I-fam may continue an I-* span
+                for src in range(n_tags):
+                    if fam_of(src) != f:
+                        mask[src, dst] = 0.0
+        # also forbid I-* as the very first tag -> handled at decode by an
+        # explicit start constraint in nll and decode.
+        # Use a large FINITE negative (not -inf): mlx.logsumexp miscompiles on
+        # graph nodes full of -inf, and a finite -NEG keeps exp(-NEG)~0 so the
+        # forbidden paths have essentially zero probability (effectively hard).
+        self.log_mask = mx.array(np.where(mask > 0, 0.0, -NEG).astype(np.float32))
+
+    def _start_forbid(self) -> mx.array:
+        """[C] addend: -NEG for I-* tags (cannot start a sequence with I-*)."""
+        out = np.zeros(self.n_tags, dtype=np.float32)
+        for k in range(self.n_tags):
+            if SLOT_LABELS[k].startswith("I-"):
+                out[k] = -NEG
+        return mx.array(out)
+
+    @staticmethod
+    def _force_padding(emissions, seq_mask):
+        """[B,T,C] -> on padding positions (seq_mask==0) force tag O (index 0):
+        set O emission to 0 and every other emission to -1e3."""
+        B, T, C = emissions.shape
+        o_col = mx.zeros((B, T, 1))
+        others = mx.full((B, T, C - 1), -NEG)
+        pad_template = mx.concatenate([o_col, others], axis=-1)
+        return mx.where(seq_mask[..., None] > 0, emissions, pad_template)
+
+    @staticmethod
+    def _onehot(idx, n):
+        """One-hot of a [B] integer index array -> [B, n]."""
+        return mx.where(idx[:, None] == mx.arange(n)[None, :], 1.0, 0.0)
+
+    def nll(self, emissions, seq_mask, tags):
+        """Negative log-likelihood of gold tag sequences (forward algorithm).
+
+        emissions [B,T,C], seq_mask [B,T] (1=real token), tags [B,T] (gold ids).
+        Returns mean NLL over the batch.
+        """
+        B, T, C = emissions.shape
+        emiss = self._force_padding(emissions, seq_mask)
+        logw = self.trans + self.log_mask  # finite -NEG on forbidden transitions
+        alpha = emiss[:, 0, :] + self._start_forbid()
+        for t in range(1, T):
+            a = alpha[:, :, None] + logw[None, :, :]  # [B,C,C]
+            alpha = mx.logsumexp(a, axis=1) + emiss[:, t, :]
+        log_z = mx.logsumexp(alpha, axis=-1)  # [B]
+        # gold path score via one-hot gathers (no integer-index gather)
+        score = mx.sum(self._onehot(tags[:, 0], C) * emiss[:, 0, :], axis=1)
+        for t in range(1, T):
+            oh_p = self._onehot(tags[:, t - 1], C)  # [B, C]
+            oh_c = self._onehot(tags[:, t], C)      # [B, C]
+            te = mx.sum(oh_p[:, :, None] * logw[None, :, :] * oh_c[:, None, :],
+                        axis=(1, 2))
+            em = mx.sum(oh_c * emiss[:, t, :], axis=1)
+            score = score + te + em
+        return mx.mean(log_z - score)
+
+    def decode(self, emissions, seq_mask):
+        """Viterbi decode -> [B,T] predicted tag ids."""
+        B, T, C = emissions.shape
+        emiss = self._force_padding(emissions, seq_mask)
+        logw = self.trans + self.log_mask
+        alpha = emiss[:, 0, :] + self._start_forbid()
+        back = []
+        for t in range(1, T):
+            a = alpha[:, :, None] + logw[None, :, :]
+            alpha = mx.max(a, axis=1) + emiss[:, t, :]
+            bp = mx.argmax(a, axis=1)
+            back.append(bp)
+        cur = mx.argmax(alpha, axis=-1)  # [B]
+        tags = [None] * T
+        tags[T - 1] = cur
+        for t in range(T - 2, -1, -1):
+            prev = mx.take_along_axis(back[t], cur[:, None], axis=1)[:, 0]
+            tags[t] = prev
+            cur = prev
+        return mx.stack(tags, axis=1)
+
+
 class V4Model(nn.Module):
     def __init__(self, vocab_size: int, d: int = 192, n_layers: int = 2,
                  n_heads: int = 4, head_dim: int = 32, ffn: int = 384,
                  max_len: int = 64, n_intents: int = len(INTENTS),
-                 n_slot: int = N_SLOT_CLASSES):
+                 n_slot: int = N_SLOT_CLASSES, use_crf: bool = False):
         super().__init__()
         self.d = d
+        self.use_crf = use_crf
         self.embedding = nn.Embedding(vocab_size, d)
         self.blocks = [Block(d, n_heads, head_dim, ffn) for _ in range(n_layers)]
         self.final_norm = RMSNorm(d)
         self.intent_head = nn.Linear(d, n_intents)
         self.slot_head = nn.Linear(d, n_slot)
+        if use_crf:
+            self.crf = CRF(n_slot)
         self.cos, self.sin = rope_freqs(head_dim, max_len)
 
     def __call__(self, x, mask=None):
