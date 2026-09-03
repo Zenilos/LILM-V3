@@ -29,12 +29,16 @@ See STATUS.md for full detail and the honest numbers.
 
 ### Next steps (in order of leverage)
 
-1. **Model-quality gap: OOD / MOVE-HANDOVER confusion & weak location span.**
-   The remaining val gap is generalization to never-seen entities/templates
-   (MOVE over-predicts HANDOVER). Lever: semantic embedding init
-   (`build_embed_init.py`), or more template/paraphrase diversity
-   (`paraphrase.py`, currently blocked on Ollama). Atomic intent is already
-   solid on in-distribution; this is the largest remaining accuracy lever.
+1. **RESOLVED — "OOD / MOVE-HANDOVER confusion" is a UNK-vocab artifact, not
+   semantic.** `classify_vocab.py` (offline, no Qwen) + `build_embed_init.py`
+   now produce `embed_init.npz`, but analysis shows it CANNOT fix the val gap:
+   17.9% of val tokens are OOV and collapse to the single UNK id, so unseen
+   entities/verbs are invisible to the model no matter the embedding. Per-intent
+   OOV share (MOVE 100%, SHOW 88%, CLEAN/HANDOVER 53%, PLAY/STOP/WAIT 0%)
+   exactly matches accuracy ordering — the model is perfect on in-vocab input.
+   See STATUS.md "Model-quality investigation". Decision pending on whether to
+   (a) accept the hard-val stance, or (b) add subword/char tokenization for OOD
+   named entities.
 2. **QAT / ternary export → ESP32.** The export pipeline (`export.py`) is done
    and round-trip verified. Convert `v5crf_mask` to ternary (QAT ramp in
    `train_student.py`, `--fp`/`--t`) and verify the accuracy drop is within
@@ -42,8 +46,6 @@ See STATUS.md for full detail and the honest numbers.
 3. **ESP32 firmware skeleton.** build system, partition table, PSRAM init, and
    wiring `chain_seg`-style segmentation + the tiny intent/slot model on-device.
    Independent of model quality.
-4. Optional: semantic embedding init (`build_embed_init.py`) if person/message
-   /location under-detection persists (see #1).
 
 ### Chain → sentence decomposition — RESOLVED (approach A)
 
@@ -74,7 +76,8 @@ joint intent + BIO slot-tagging model over **atomic** commands. Status:
 balanced atomic set), `v4_model.py` / `v4_train.py` (trainer with CRF slot
 loss + `--use-crf/--wd/--score-norm/--embed-init`, best-checkpoint saving),
 `v4_eval.py` (per-intent + per-family value extraction, `--use-crf` Viterbi),
-`build_embed_init.py` (semantic-category embedding init).
+`build_embed_init.py` (semantic-category embedding init),
+`classify_vocab.py` (offline vocab→category builder from `corpus.py`, no Qwen).
 
 Docs updated: STATUS.md V4 + V5 sections; NEXT.md V5 section.
 

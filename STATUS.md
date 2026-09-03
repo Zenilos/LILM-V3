@@ -123,6 +123,47 @@ Eval: `~/p3.11/bin/python3 chain_eval.py --ckpt checkpoints/v5crf_mask/best.npz`
 
 ---
 
+## Model-quality investigation — the OOD gap is a UNK-vocab artifact, not embeddable
+
+The pre-existing "semantic embedding init" idea (`build_embed_init.py`) presumes
+a `data/v4/vocab_cats.json` (word → LOCATION/PERSON/... category) produced by
+`classify_vocab.py` from a Qwen/Ollama model. **Neither file exists in this
+repo**, and I verified Qwen is not present. Pivot: `classify_vocab.py` now
+builds `vocab_cats.json` **fully offline** by reading the entity pools /
+durations / action verbs directly from `corpus.py` (no LLM). `build_embed_init.py`
+then emits `data/v4/embed_init.npz` (310×192, matches the train vocab).
+
+**But the pivot revealed the approach is orthogonal to the real problem.** The
+word vocab is tiny (310) because the corpus is template-based, and the val set
+is adversarial by design (entity pools split train/val, plus val-only `move_v`
+templates using verbs "navigate/roll/trundle"). Quantified:
+
+- 17.9% of all val tokens are **OOV** → all collapse to the single UNK id (0)
+  at inference (`v4_eval.py:81`), so the model literally cannot see the word.
+- Per-intent OOV row share: **MOVE 100%**, SHOW 88%, CLEAN/HANDOVER 53%,
+  **PLAY/STOP/WAIT 0%**.
+
+This **exactly** matches the measured accuracy ordering (PLAY/STOP/WAIT 100%,
+CLEAN 100%, HANDOVER 96%, SHOW 86%, MOVE 58%): the model is flawless on
+in-vocabulary input and degrades precisely as unseen tokens rise. Because OOV
+entities all share one UNK embedding, **no embedding init can separate them** —
+it only re-labels in-vocab words, which are already handled.
+
+**Conclusion:** the documented "MOVE-HANDOVER confusion / weak location span"
+is a **tokenization-vocabulary artifact**, not a semantic-learning gap. Real
+options, in order of value:
+1. **Decide the eval stance.** The val pool-split deliberately tests unseen
+   named entities/verbs; a from-scratch fixed-vocab model is legitimately
+   expected to miss them. If the goal is realistic commands (known rooms/names),
+   the model is already strong on those surfaces.
+2. **Subword / char n-gram tokenization** so novel names decompose ("conservatory"
+   → known substrings) instead of collapsing to UNK. Larger change; only worth
+   it if OOD named entities are a real deployment target.
+3. Semantic embed init (`--embed-init embed_init.npz`) only as a minor
+   regularization for in-vocab slot-role disambiguation; **not** a fix for OOD.
+
+---
+
 
 ## V4 branch — joint intent + slot-tagger pivot (atomic commands)
 
