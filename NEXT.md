@@ -1,11 +1,38 @@
 # NEXT.md — What to do now
 
-_Last updated: 2026-09-03 (V5 complete: schema simplification, length-
-invariance, chain→sentence segmentation; next: OOD/quality, QAT→ESP32)_
+_Last updated: 2026-09-03 (V5 fp16 deployment bring-up)_
 
 This is a working plan, not a design doc. It picks up after commit `0cd1536`
 (all bug fixes, scheduled sampling, KD, model.py reconciliation) and the
 **completed fp_v2 baseline** (Step 1, see below).
+
+---
+
+## V5 deployment bring-up — next steps
+
+The deployment path is now plain fp16, not ternary/QAT. fp16 storage is
+lossless for `v5crf_mask/best.npz`; the 1,414,502-byte `model.bin` is decoded
+to fp32 for computation. `export_v4.py` emits `model.toc`, and the C runtime
+loads checkpoint `cos`/`sin` verbatim rather than recomputing RoPE.
+
+1. **Fix host parity.** Run `~/p3.11/bin/python3
+   firmware/tests/run_host_test.py --dir /tmp/export_v5_fp16 --n 1500`. The
+   current result is 56.7% intent versus the 59.3% reference, with large
+   C-vs-MLX logit errors. Isolate the first block-0 divergence in this order:
+   RMSNorm, q/k/v, RoPE, attention scores/softmax, value combine, o-projection,
+   then block 1 and the heads.
+2. **Lock acceptance.** Require 59.3% intent, 39.8% person, and approximately
+   1e-3 maximum C-vs-MLX logit error with matching argmaxes. Re-run at both
+   `-O0` and `-O2`.
+3. **Clean the host path.** Remove temporary dump programs and debug-only
+   output, while retaining the host regression harness.
+4. **Wire ESP-IDF.** Add the component, model data partition, embedded
+   `model.bin`/`model.toc`, tokenizer, and a `main` smoke test.
+5. **Flash and validate.** Build and flash the connected XIAO ESP32-S3 N8R8;
+   compare serial predictions against the host reference.
+6. **V6 later.** If unseen entities matter, replace the fixed word vocabulary's
+   UNK path with subword or character n-gram tokenization. Keep this separate
+   from deployment bring-up.
 
 ---
 

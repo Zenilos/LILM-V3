@@ -1,78 +1,58 @@
-# firmware/ — ESP32 runtime for the V5 joint intent + slot model
+# firmware/ - ESP32 runtime for the V5 joint intent + slot model
 
-This is a **skeleton** (plan + header/source scaffolding, not yet compiling /
-not yet wired to a real `.tern` from the V5 exporter). It documents the
-on-device architecture and the exact quantization/packing contract the C
-runtime must honor. Review, then implement the exporter + this runtime together.
+This is the V5 fp16 deployment runtime. `export_v4.py --mode fp16` writes a
+raw fp16 `model.bin` and binary `model.toc`; the C loader decodes weights to
+fp32 and performs inference in fp32. Host parity is still being debugged
+before IDF wiring or flashing.
 
-## What changed vs the old `fsm.c`
+## Model
 
-The V4/V5 model is a **joint intent + BIO slot tagger** (transformer encoder
-→ frame-level `intent` + per-token `slot` logits, decoded by a linear-chain
-CRF). It is **not** the autoregressive PlanCore generative model that `fsm.h`/
-`fsm.c` / the old `model.tern` implement. On device:
+The model is a bidirectional transformer encoder with intent and BIO slot
+heads, followed by local CRF Viterbi decoding. It is not the autoregressive
+PlanCore model in `fsm.c`. Input is `[CLS]` (id 0) followed by word-vocabulary
+ids, with OOV words mapped to id 0. The fp16 blob is 1.41 MB and fits the XIAO
+ESP32-S3 N8R8 flash.
 
-1. Tokenize the utterance against the small (310) word vocab; OOV → id 0.
-2. [CLS] = id 0 prepended.
-3. One transformer encoder forward (mean-pool over non-padding → `intent_logits`;
-   per-token → `slot_logits`).
-4. CRF Viterbi over the BIO slot logits → span labels; decode into slots.
-5. `intent` + `slots` drive action execution (same `Action` semantics as dsl.py).
+Checkpoint RoPE `cos`/`sin` values are exported and loaded verbatim. They must
+not be recomputed on-device because the checkpoint frequencies differ from the
+default helper in `v4_model.py`.
 
-No autoregressive decode; no KV cache; single-shot forward. Much smaller than
-the old model: **~0.23 MB** blob vs 3.63 MB.
+## Storage contract
 
-## Memory map (ESP32-S3 N16R8: 16 MB flash, 8 MB PSRAM)
+- All tensors, including `cos`/`sin`, are IEEE fp16.
+- `v5_load()` decodes tensors into one owned fp32 allocation.
+- `model.toc` contains tensor names, offsets, byte counts, and nine config
+  values, replacing device-side JSON parsing.
 
-| Region | Contents | Size |
-|---|---|---|
-| Flash | `v5_model.tern` + manifest | ~0.23 MB |
-| Internal SRAM | activations + int8 embeddings (~310×192) | < 100 KB |
-| (PSRAM optional) | none required | 0 |
+## Host test
 
-Because the model is small enough for internal flash/SRAM, it can run entirely
-in internal memory; PSRAM is not needed (unlike the old 3.63 MB model). This
-kills the old KV-cache/PSRAM constraints.
-
-## Quantization contract (match `export_v4.py` / `export.py`)
-
-- **Linear weights** (`q/k/v/o`, `w1/w2/w3`, `intent_head`, `slot_head`):
-  ternary {-1,0,+1}, per-output-channel absmean scale (fp16), packed **5
-  trits/byte**. Decode: `digit_{5b+i} = (byte_b / 3^i) % 3`, then `-1`.
-- **Embedding**: int8, per-row scale = max|w|/127.
-- **RMSNorm / biases / CRF `trans`**: fp16.
-- **Manifest**: `tensors` with `offset/nbytes/shape/kind` so the loader maps
-  the blob into pointers without copying.
-
-The C `unpack_trits` below is the reference decode of `export.pack_trits`.
-
-## Build (skeleton — files not yet wired into an idf-component)
-
-Intended layout (ESP-IDF):
-
+```bash
+~/p3.11/bin/python3 firmware/tests/run_host_test.py \
+  --dir /tmp/export_v5_fp16 --n 1500
 ```
+
+The current kernel is not at parity: it reaches 56.7% intent versus the 59.3%
+reference, with the first known divergence in block-0 attention. Compare
+RMSNorm, q/k/v, RoPE, attention scores/softmax, value combine, o-projection,
+block 1, and heads in that order. Acceptance is 59.3% intent, 39.8% person,
+and approximately 1e-3 maximum C-vs-MLX logit error.
+
+## IDF layout
+
+```text
 firmware/
-  CMakeLists.txt          # idf-component: v5_model.c
+  CMakeLists.txt
   include/v5_model.h
   src/v5_model.c
-  partitions.csv          # flash: v5_model 0x20000 size auto
-  main/                   # app: init periphs, load model, run
+  partitions.csv
+  main/
 ```
 
-Public API (see `v5_model.h`):
+## TODO
 
-- `v5_load(manifest_path, blob_base)` — parse manifest, set tensor pointers.
-- `v5_forward(tokens, n)` → `intent_idx`, `slot_logits[n][9]`.
-- `v5_decode_slots(slot_logits, n)` → span list via local CRF Viterbi.
-
-## TODO (gates before this compiles/runs)
-
-- [ ] `export_v4.py`: emit a V5 manifest/blob matching the contract above
-      (see STATUS "Deployment" section, QAT plan step 4).
-- [ ] QAT `v5crf_qat` checkpoint (`v4_train.py --t` ramp) — STAT plan step 1-3.
-- [ ] C: wire `unpack_trits` + int8 embed + fp16 scales into `v5_forward`
-      matmuls (skeleton has the byte-layout scaffold).
-- [ ] C: CRF Viterbi — needs `SLOT_LABELS` family table export (additive `trans`
-      + start-forbid for `I-*`).
-- [ ] IDF component + partition + `main` stub (test on host first via a small
-      ANSI-C driver mirroring `quant_eval.py` expectations).
+- [ ] Fix host parity and rerun at both `-O0` and `-O2`.
+- [ ] Remove temporary dump helpers while retaining the regression harness.
+- [ ] Add IDF component, model partition/data embedding, tokenizer, and main
+      smoke test.
+- [ ] Build, flash, and validate on the XIAO ESP32-S3 N8R8.
+- [ ] Keep V6 subword/character tokenization separate from deployment bring-up.

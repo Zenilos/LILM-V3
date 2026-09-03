@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import struct
 
 import numpy as np
 
@@ -156,6 +157,26 @@ def main():
         f.write(bytes(blob))
     with open(os.path.join(a.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
+
+    # binary table-of-contents mirror of manifest['tensors'] so the on-device C
+    # loader needs no JSON parser. Format (all little-endian):
+    #   u32 n_tensors; then per tensor:
+    #   u16 name_len; char name[name_len]; u32 offset; u32 nbytes;
+    # plus a trailing config block: i32 d n_layers n_heads head_dim ffn max_len
+    # n_intent n_tag vocab  (9 ints).
+    bo = bytearray()
+    bo += struct.pack("<I", len(manifest["order"]))
+    for name in manifest["order"]:
+        t = manifest["tensors"][name]
+        nb = name.encode()
+        bo += struct.pack("<H", len(nb)) + nb
+        bo += struct.pack("<II", t["offset"], t["nbytes"])
+    cfg = manifest["config"]
+    bo += struct.pack("<9i", cfg["d"], cfg["n_layers"], cfg["n_heads"],
+                      cfg["head_dim"], cfg["ffn"], cfg["max_len"],
+                      cfg["n_intent"], cfg["n_tag"], cfg["vocab"])
+    with open(os.path.join(a.out, "model.toc"), "wb") as f:
+        f.write(bytes(bo))
 
     total = len(blob)
     print(f"mode={a.mode} config: {cfg}")

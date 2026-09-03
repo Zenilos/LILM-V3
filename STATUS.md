@@ -8,6 +8,35 @@ the concrete next steps. It is the working record for the solo session; see
 
 ---
 
+## Deployment — fp16 host bring-up (IN PROGRESS)
+
+The current deployment path uses plain fp16 storage and fp32 computation.
+`export_v4.py --mode fp16` writes `model.bin`, `manifest.json`, and binary
+`model.toc`; `firmware/src/v5_model.c` decodes the blob and runs the encoder,
+heads, and CRF. The checkpoint's `cos`/`sin` are loaded verbatim because the
+checkpoint frequencies differ from the default RoPE helper.
+
+The host kernel is not at parity yet. The latest run is 56.7% intent (851/1500)
+versus the 59.3% reference, with intent-logit max error 6.477 and slot-logit
+max error 8.864. The first known divergence is in block-0 attention. Do not
+wire or flash until the stage is isolated and fixed.
+
+Required gates:
+
+1. Compare C against NumPy/MLX for RMSNorm, q/k/v, RoPE, scores/softmax, value
+   combine, o-projection, block 1, and the output heads.
+2. Re-run the host test at `-O0` and `-O2` after the fix.
+3. Require 59.3% intent, 39.8% person, and roughly 1e-3 C-vs-MLX logit error.
+4. Remove temporary dump helpers, then add the IDF component, model partition,
+   tokenizer, and `main` smoke test.
+5. Build, flash the XIAO ESP32-S3 N8R8, and compare serial predictions with the
+   host reference.
+
+The fixed 310-word vocabulary maps unseen words to one UNK id. Subword or
+character n-gram tokenization is the separate V6 quality track.
+
+---
+
 ## V5 — drop file/object, merge recipient→person (COMPLETE + finding)
 
 Branch `V5` implemented the schema simplification: PLAY became intent-only,
