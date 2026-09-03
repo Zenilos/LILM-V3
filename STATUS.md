@@ -400,3 +400,5 @@ These are regenerable and excluded from git (see `.gitignore`):
 `intent_only.py`, `mid-training-eval.py`, `export.py`, `fsm.h`, `fsm.c`.
 V4 branch adds: `v4_model.py`, `v4_train.py`, `v4_data.py`,
 `v4_decompose.py`, `v4_eval.py`, `v4_inspect.py`, `intent_atomic.py`.
+V5 branch adds: `chain_seg.py` (chain→sentence segmenter),
+`chain_eval.py` (end-to-end chain→classify harness).

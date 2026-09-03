@@ -1,6 +1,7 @@
 # NEXT.md — What to do now
 
-_Last updated: 2026-09-03_
+_Last updated: 2026-09-03 (V5 complete: schema simplification, length-
+invariance, chain→sentence segmentation; next: OOD/quality, QAT→ESP32)_
 
 This is a working plan, not a design doc. It picks up after commit `0cd1536`
 (all bug fixes, scheduled sampling, KD, model.py reconciliation) and the
@@ -8,43 +9,41 @@ This is a working plan, not a design doc. It picks up after commit `0cd1536`
 
 ---
 
-## V5 — drop file/object, merge recipient→person (COMPLETE)
+## V5 — COMPLETE (schema simplification + length-invariance + chain→sentence)
 
-Schema simplification shipped (see STATUS.md V5 section for full detail and
-numbers). Retrained CRF model at `checkpoints/v5crf/best.npz`:
+All V5 work is done and committed on branch `V5`:
 
-- intent_acc **99.996%**, span F1 **0.769**, duration 100% / location 85% /
-  message 62% / person 37% (measured batched/padded like training).
-- Ranking up from V4 intent 85.9% / span F1 ~0.5.
+1. **Schema simplification** — dropped `object`/`file`, merged
+   `recipient`→`person`. Families: `location/person/message/duration`
+   (9 BIO tags). Retrained CRF → `checkpoints/v5crf/`.
+2. **Length-invariance fix** — attention key-padding mask. Model now gives
+   identical logits unpadded vs padded (was a padding-leak that made on-device
+   single-utterance inference wrong: "stop"→SHOW). Retrained →
+   `checkpoints/v5crf_mask/best.npz`. Honest intent **90.2%**, span F1 0.630.
+3. **Chain → sentence segmentation** — `chain_seg.py` breaks a chain into
+   atomic sentences gold-free; `chain_eval.py` verifies end-to-end:
+   intent/clause 95.9%, **model-only 98.2% intent / 94.5% intent+slots**.
+   Approach B (learned boundaries) not needed.
 
-### BLOCKER — model is not length-invariant (padding leak)
+See STATUS.md for full detail and the honest numbers.
 
-`v4_eval.py` (unpadded, natural-length single utterances = the on-device case)
-reports only **20% STOP / 89% intent**. Root cause: unmasked bidirectional
-attention lets padding (id 0) tokens leak positional signal into real tokens.
-"stop" unpadded → SHOW; padded → STOP. Must mask attention over padding and
-retrain so unpadded == padded. **This is the deployment-correctness fix.**
+### Next steps (in order of leverage)
 
-### Next steps (in order)
-
-1. **DONE — Attention-mask fix.** Threaded key-padding mask through
-   `Attention`/`Block`/`V4Model` (`-1e4` over padding keys). Model is now
-   length-invariant (unpadded == padded, diff 0.0). Retrained
-   `checkpoints/v5crf_mask/best.npz`. Honest intent **90.2%**, span F1 0.630;
-   `v4_eval` (unpadded) and batched now agree exactly per-intent. The earlier
-   ~100% was a padding-leak inflation. Remaining gap is OOD generalization
-   (val uses held-out entities/templates; MOVE over-predicts HANDOVER).
-2. **DONE — Chain → sentence decomposition (approach A).** `chain_seg.py`
-   breaks a chain into atomic sentences gold-free (connectives + anaphora
-   resolution), each fed to the V5 model. End-to-end: seg-count 93.7%,
-   intent/clause 95.9%, intent+slots 91.2%; **model-only 98.2% intent / 94.5%
-   intent+slots** on correctly-segmented clauses. **Approach B (learned
-   boundary model) NOT needed** — remaining failures are corpus bare-space
-   joins and a comma-appositive template, not realistic or boundary-learnable.
-   Revisit B only if real deployments show unseen boundaries. See STATUS.md
-   Chain section.
-3. Optional: semantic embedding init (`build_embed_init.py`) if person/message
-   /location under-detection persists.
+1. **Model-quality gap: OOD / MOVE-HANDOVER confusion & weak location span.**
+   The remaining val gap is generalization to never-seen entities/templates
+   (MOVE over-predicts HANDOVER). Lever: semantic embedding init
+   (`build_embed_init.py`), or more template/paraphrase diversity
+   (`paraphrase.py`, currently blocked on Ollama). Atomic intent is already
+   solid on in-distribution; this is the largest remaining accuracy lever.
+2. **QAT / ternary export → ESP32.** The export pipeline (`export.py`) is done
+   and round-trip verified. Convert `v5crf_mask` to ternary (QAT ramp in
+   `train_student.py`, `--fp`/`--t`) and verify the accuracy drop is within
+   budget. This is deployment enablement (Phase 5 in PLAN.md).
+3. **ESP32 firmware skeleton.** build system, partition table, PSRAM init, and
+   wiring `chain_seg`-style segmentation + the tiny intent/slot model on-device.
+   Independent of model quality.
+4. Optional: semantic embedding init (`build_embed_init.py`) if person/message
+   /location under-detection persists (see #1).
 
 ### Chain → sentence decomposition — RESOLVED (approach A)
 
