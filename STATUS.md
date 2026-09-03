@@ -1,10 +1,99 @@
 # STATUS — PlanCore-11M (training investigation)
 
-_Last updated: 2026-09-02_
+_Last updated: 2026-09-03_
 
 This file documents what exists, what we found while debugging training, and
 the concrete next steps. It is the working record for the solo session; see
 `PLAN.md` (roadmap) and `ARCHITECTURE.md` (normative design) for the full plan.
+
+---
+
+## V5 branch — drop file/object, merge recipient→person (HANDOFF)
+
+Branch `V5` was created from `V4` after the CRF results below. **No V5 code
+changes have been made yet** — this section is the resume point.
+
+### The change (decided by user, partially in progress)
+
+Simplify the slot schema so the model only has to extract slots the CRF is
+already good at, rather than burning capacity on families it gets 0% on:
+
+- **PLAY**: drop the `file` slot → PLAY becomes intent-only (no slots).
+- **HANDOVER**: drop the `object` slot AND merge `recipient` → `person`.
+  After the merge, `person` is the single "who" family shared by MOVE (opt),
+  SHOW (opt), and HANDOVER (opt). HANDOVER becomes object-less: "hand/take
+  this to John".
+- **Object** itself is deleted entirely (as requested).
+
+New target schema (families): `location`, `person`, `message`, `duration`.
+NOTHING else. `SLOT_LABELS` then has 1 + 2*4 = **9** BIO tags
+(`O, B/I-(location,person,message,duration)`) instead of 15.
+
+### Files to change (all verified current as of V5 base)
+
+1. `dsl.py`
+   - `SLOTS`: `PLAY → {"required": (), "optional": ()}`;
+     `HANDOVER → {"required": (), "optional": ("person",)}`.
+   - `ALL_SLOTS`: drop `object`, `recipient`, `file`. Keep
+     `location, duration_amount, duration_unit, message, person`.
+   - `SLOT_DESC`: drop object/recipient/file prose; fold recipient prose into
+     person ("third party the object goes to: John, my wife, the kids").
+2. `corpus.py`
+   - PLAY templates (`_t(f"play{i}", ...)`, ~line 167) currently fill
+     `{file}`; must produce slot-less utterances (e.g. "play music", "start
+     playing", "cue up a song"). Remove the PLAY file-entity usage.
+   - HANDOVER templates (~line 186) currently fill object+recipient; must
+     become object-less and use `{"person": "person"}` instead of
+     `recipient` (e.g. "bring this to {person}", "hand this to {person}",
+     "take it over to {recipient/person}"). Remove object-entity usage.
+   - Check `_t` uses `action={"intent": ..., "slots": {...}}` — ensure the
+     slots dict uses `person` for HANDOVER now.
+3. `v4_model.py`
+   - The `for slot in [...]` that builds `SLOT_LABELS` (~line 32) → remove
+     `object`, `recipient`, `file`, leaving
+     `["location", "person", "message", "duration"]`. `N_SLOT_CLASSES` → 9.
+4. `v4_train.py`
+   - `SLOT_FAMILY` (~line 36): remove object/recipient/file entries.
+5. `v4_decompose.py` / `v4_data.py` — they read `SLOTS` from `dsl`, so once
+   dsl/corpus are updated the regenerate picks up the new schema
+   automatically. Verify no hardcoded family names remain.
+6. `v4_eval.py` — reads `SLOT_FAMILY`, so automatic after v4_train; no
+   file/object/recipient references should remain.
+
+### Regenerate + retrain (the actual work)
+
+```bash
+# 1. regenerate train/val atomic+balanced sets with the new schema
+~/p3.11/bin/python3 v4_data.py --split train --out data/v4/train_balanced.jsonl \
+   --reject-jsonl data/train_a.jsonl --n-atomic 300000 --per-intent 8000
+~/p3.11/bin/python3 v4_data.py --split val --out data/v4/val_balanced.jsonl \
+   --reject-jsonl data/train_a.jsonl --n-atomic 60000 --per-intent 8000
+# (per-intent target may need a smoke first; also still need the val-pool path
+#  that the old val was built from — check v4_decompose for the exact val cmd)
+
+# 2. retrain with CRF (best-checkpoint saving + weight decay)
+nohup ~/p3.11/bin/python3 v4_train.py \
+  --train data/v4/train_balanced.jsonl --val data/v4/val_balanced.jsonl \
+  --out checkpoints/v5 --d 192 --layers 2 --heads 4 --head-dim 32 --ffn 384 \
+  --epochs 14 --batch 256 --lr 3e-3 --slot-w 1.5 --use-crf --wd 0.01 --score-norm \
+  > logs/v5.log 2>&1 &
+
+# 3. eval the saved best checkpoint
+~/p3.11/bin/python3 v4_eval.py --ckpt checkpoints/v5/best.npz \
+  --use-crf --train data/v4/train_balanced.jsonl --val data/v4/val_balanced.jsonl
+```
+
+### Why this should help
+
+The CRF already lifts span F1 ~0.26→~0.5 and value extraction location
+5%→90%, message 0%→38%, person 14%→34%. The two families that stayed at
+**0% were exactly `file` and `object`** — the ones the user chose to drop.
+`recipient` and `person` extract similarly (both "who"), so merging removes
+a confusing split-BIO family (they were downstream-identical already). After
+V5 the model only tags location/person/message/duration — all families where
+the CRF head demonstrably works — so the weak-on-empty-slot problem disappears
+and intent (which the score-norm best-checkpoint trades force down) should
+recover toward 85%+ while slots hold.
 
 ---
 
