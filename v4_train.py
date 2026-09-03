@@ -245,6 +245,9 @@ def main():
                     help="save best by normalized intent+spanF1 instead of last epoch")
     ap.add_argument("--embed-init", default=None,
                     help="npz with an 'embedding' [V,d] matrix to init the embedding")
+    ap.add_argument("--t", type=float, default=0.0,
+                    help="QAT final ternary ramp in [0,1] (0=fp). Annealed "
+                         "linear 0->t over the run, held at t for the last 25%%.")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
 
@@ -296,7 +299,16 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     start = time.time()
     best_score = -1.0
+    hold_epochs = max(1, int(a.epochs * 0.25))  # hold ramp at t for last 25%
+    ramp_start = int(a.epochs - hold_epochs) if a.t > 0 else 0
     for ep in range(1, a.epochs + 1):
+        # QAT annealing: linear 0->t over [1, ramp_start], then hold at t.
+        if a.t > 0:
+            if ep < ramp_start:
+                ramp = a.t * (ep - 1) / max(1, ramp_start - 1)
+            else:
+                ramp = a.t
+            model.set_ramp(ramp)
         np.random.shuffle(train_rows)
         running = 0.0
         nstep = 0
@@ -310,7 +322,7 @@ def main():
             nstep += 1
         elapsed = time.time() - start
         print(f"[epoch {ep}/{a.epochs}] loss={running/max(1,nstep):.4f} "
-              f"({elapsed:.0f}s) | val:", flush=True)
+              f"ramp={model.ramp:.3f} ({elapsed:.0f}s) | val:", flush=True)
         res = evaluate(model, val_rows, bt, a.max_len)
         state = _flatten(model.parameters())
         npz = {k: np.asarray(v) for k, v in state.items()}

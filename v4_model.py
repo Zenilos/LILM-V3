@@ -12,8 +12,10 @@ This is the classic joint intent-slot architecture (Goo et al. 2018),
 decomposed from the failing end-to-end generative FSM model: intent is a
 multi-class decision, slots are BIO span labels, no autoregressive cascade.
 
-All layers are plain fp16/fp32 (no ternary STE) so we can measure the ceiling
-first; quantization is a later step.
+All linears can be quantized with a straight-through ternary estimator for QAT
+(`V4Model.set_ramp(t)`, default ramp 0 = plain fp), matching the on-device
+ternary packer so a QAT checkpoint is directly exportable. Embedding and norms
+stay fp (embedding is int8 on device).
 """
 
 from __future__ import annotations
@@ -36,6 +38,26 @@ N_SLOT_CLASSES = len(SLOT_LABELS)
 
 # large finite negative used to (soft-)forbid impossible BIO transitions
 NEG = 1e4
+
+
+def ternary_ste(w: mx.array, t: float) -> mx.array:
+    """BitNet b1.58 straight-through ternary (same contract as export/quant_eval).
+    t=0 -> latent fp; t=1 -> fully ternary {-1,0,+1} with per-row absmean scale.
+    Straight-through: forward uses the quantized value, backward identity, so
+    the fp master weight is what gets updated."""
+    if t <= 0:
+        return w
+    scale = mx.mean(mx.abs(w), axis=-1, keepdims=True)
+    wn = w / mx.maximum(scale, 1e-9)
+    th = 0.5 * t
+    q = mx.where(wn > th, 1.0, mx.where(wn < -th, -1.0, 0.0))
+    return mx.stop_gradient(q) * t + w * (1.0 - t)
+
+
+def qlinear(x: mx.array, lin, ramp: float) -> mx.array:
+    """Linear fwd with the weight passed through ternary_ste at current ramp."""
+    w = ternary_ste(lin.weight, ramp)
+    return x @ w.T + lin.bias
 
 
 class RMSNorm(nn.Module):
@@ -76,6 +98,7 @@ class Attention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.scale = head_dim ** -0.5
+        self.ramp = 0.0
         self.q = nn.Linear(d, n_heads * head_dim)
         self.k = nn.Linear(d, n_heads * head_dim)
         self.v = nn.Linear(d, n_heads * head_dim)
@@ -87,9 +110,10 @@ class Attention(nn.Module):
         this makes the model invariant to sequence length (a single unpadded
         utterance gives the same logits as the same utterance padded in a batch)."""
         B, T, _ = x.shape
-        q = self.q(x).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k(x).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v(x).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        ramp = self.ramp
+        q = qlinear(x, self.q, ramp).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = qlinear(x, self.k, ramp).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = qlinear(x, self.v, ramp).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         attn = (q @ k.transpose(0, 1, 3, 2)) * self.scale
@@ -100,20 +124,23 @@ class Attention(nn.Module):
         attn = mx.softmax(attn, axis=-1)
         out = attn @ v
         out = out.transpose(0, 2, 1, 3).reshape(B, T, self.n_heads * self.head_dim)
-        return self.o(out)
+        return qlinear(out, self.o, self.ramp)
 
 
 class FFN(nn.Module):
     def __init__(self, d: int, hidden: int):
         super().__init__()
         self.norm = RMSNorm(d)
+        self.ramp = 0.0
         self.w1 = nn.Linear(d, hidden)
         self.w2 = nn.Linear(hidden, d)
         self.w3 = nn.Linear(d, hidden)
 
     def __call__(self, x):
         r = self.norm(x)
-        return self.w2(nn.silu(self.w1(r)) * self.w3(r))
+        ramp = self.ramp
+        h = nn.silu(qlinear(r, self.w1, ramp)) * qlinear(r, self.w3, ramp)
+        return qlinear(h, self.w2, ramp)
 
 
 class Block(nn.Module):
@@ -243,6 +270,7 @@ class V4Model(nn.Module):
         super().__init__()
         self.d = d
         self.use_crf = use_crf
+        self.ramp = 0.0
         self.embedding = nn.Embedding(vocab_size, d)
         self.blocks = [Block(d, n_heads, head_dim, ffn) for _ in range(n_layers)]
         self.final_norm = RMSNorm(d)
@@ -251,6 +279,13 @@ class V4Model(nn.Module):
         if use_crf:
             self.crf = CRF(n_slot)
         self.cos, self.sin = rope_freqs(head_dim, max_len)
+
+    def set_ramp(self, t: float) -> None:
+        """Set the ternary STE ramp for all submodules (QAT annealing)."""
+        self.ramp = float(t)
+        for b in self.blocks:
+            b.attn.ramp = float(t)
+            b.ffn.ramp = float(t)
 
     def __call__(self, x, mask=None):
         """x: [B, T] token ids. Returns (intent_logits [B, K], slot_logits [B, T, S]).
@@ -265,8 +300,8 @@ class V4Model(nn.Module):
         # intent: mean-pool over non-padding tokens (CLS + utterance)
         mask = mask[..., None]
         pooled = (h * mask).sum(axis=1) / mx.maximum(mask.sum(axis=1), 1.0)
-        intent_logits = self.intent_head(pooled)
-        slot_logits = self.slot_head(h)
+        intent_logits = qlinear(pooled, self.intent_head, self.ramp)
+        slot_logits = qlinear(h, self.slot_head, self.ramp)
         return intent_logits, slot_logits
 
 
