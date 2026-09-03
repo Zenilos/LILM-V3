@@ -59,10 +59,20 @@ def load_blob(manifest_path, blob_path):
         return i8 * scale.reshape(-1, 1)
 
     tree = {}
+    mode = m.get("mode", "ternary")
     for name in tensors:
         kind = tensors[name]["kind"]
         shape = tuple(tensors[name]["shape"])
         n = int(np.prod(shape)) if shape else 1
+        if mode == "fp32":
+            arr, _ = raw(name)
+            tree[name] = np.frombuffer(arr[:n * 4], np.float32).reshape(shape).copy()
+            continue
+        if mode == "fp16":
+            # all tensors stored fp16, keys already match model params
+            arr, _ = f16(name, n)
+            tree[name] = arr.reshape(shape)
+            continue
         if kind == "tern":
             if name.endswith(".scale"):
                 continue
@@ -84,14 +94,14 @@ def load_blob(manifest_path, blob_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
+    ap.add_argument("--ckpt", default=None,
+                    help="load from .npz directly (debug: bypass blob) instead "
+                         "of the blob in --dir")
     ap.add_argument("--val", default="data/v4/val_balanced.jsonl")
     ap.add_argument("--train", default="data/v4/train_balanced.jsonl")
     ap.add_argument("--n", type=int, default=0)
     a = ap.parse_args()
 
-    manifest, tree_arrays = load_blob(os.path.join(a.dir, "manifest.json"),
-                                      os.path.join(a.dir, "model.tern"))
-    cfg = manifest["config"]
     rows = [json.loads(l) for l in open(a.val)]
     if a.n:
         rows = rows[:a.n]
@@ -99,6 +109,17 @@ def main():
     bt = build_base_tok([" ".join(r["tokens"]) for r in tr], size=4096)
     w2i = bt.word2id
 
+    if a.ckpt:
+        data = np.load(a.ckpt, allow_pickle=False)
+        tree_arrays = {k: data[k] for k in data.files}
+        cfg = {"vocab": int(data["embedding.weight"].shape[0]),
+               "d": 192, "n_layers": 2}
+    else:
+        manifest, tree_arrays = load_blob(
+            os.path.join(a.dir, "manifest.json"),
+            os.path.join(a.dir, "model.bin" if os.path.exists(
+                os.path.join(a.dir, "model.bin")) else "model.tern"))
+        cfg = manifest["config"]
     model = V4Model(vocab_size=cfg["vocab"], d=cfg["d"], n_layers=cfg["n_layers"],
                     use_crf=True)
     # dotted keys from manifest -> nested {blocks:[{attn:{...}}], ...} (v4_eval fmt)
