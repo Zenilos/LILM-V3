@@ -39,13 +39,21 @@ See STATUS.md for full detail and the honest numbers.
    See STATUS.md "Model-quality investigation". Decision pending on whether to
    (a) accept the hard-val stance, or (b) add subword/char tokenization for OOD
    named entities.
-2. **QAT / ternary export → ESP32.** The export pipeline (`export.py`) is done
-   and round-trip verified. Convert `v5crf_mask` to ternary (QAT ramp in
-   `train_student.py`, `--fp`/`--t`) and verify the accuracy drop is within
-   budget. This is deployment enablement (Phase 5 in PLAN.md).
-3. **ESP32 firmware skeleton.** build system, partition table, PSRAM init, and
-   wiring `chain_seg`-style segmentation + the tiny intent/slot model on-device.
-   Independent of model quality.
+2. **IN PROGRESS — QAT / ternary export → ESP32.** Measured: V5 is only ~706k
+   params → ~0.23 MB ternary blob (vs old 3.63 MB). **Plain PTQ ternary
+   collapses the model (0% intent, verified via new `quant_eval.py`) — so full
+   QAT retraining is mandatory.** There is no PTQ shortcut. Plan: add `--t`
+   ramp (straight-through ternarize of linears) to `v4_train.py`, anneal 0→1,
+   validate vs fp within ~2 pts intent / ~0.02 span F1, then write `export_v4.py`
+   (maps `V4Model` → the existing blob/packing contract incl. CRF). See STATUS
+   "Deployment" section.
+3. **ESP32 firmware skeleton — DONE (review).** `firmware/` README + `v5_model.h/
+   .c` skeleton implements the numeric quant/primitives (5-trits/byte unpack,
+   int8 embed, fp16 scales, RMSNorm, ternary matmul, CRF scaffold), compiles
+   clean. NOT yet wired: manifest loader / tensor pointer mapping pending
+   `export_v4.py`; IDF component + partition + `main` stub. See firmware/README
+   TODO gates.
+
 
 ### Chain → sentence decomposition — RESOLVED (approach A)
 

@@ -159,10 +159,65 @@ options, in order of value:
 2. **Subword / char n-gram tokenization** so novel names decompose ("conservatory"
    → known substrings) instead of collapsing to UNK. Larger change; only worth
    it if OOD named entities are a real deployment target.
-3. Semantic embed init (`--embed-init embed_init.npz`) only as a minor
-   regularization for in-vocab slot-role disambiguation; **not** a fix for OOD.
+ 3. Semantic embed init (`--embed-init embed_init.npz`) only as a minor
+    regularization for in-vocab slot-role disambiguation; **not** a fix for OOD.
 
 ---
+
+## Deployment — QAT/ternary export + ESP32 (PLAN; measure first, user to review)
+
+### Model footprint (huge win)
+
+V5 (`v5crf_mask/best.npz`) is only **~706k params**. Ternary + int8 + fp16
+blob ≈ **0.23 MB** — vs the old 11.1M generative model at 3.63 MB. Fits
+ESP32-S3 internal flash easily with no PSRAM pressure. `export.py` currently
+targets the old generative `ModelConfig`; it does NOT understand `v4_model.V4Model`
+(8 linear heads, `{q,k,v,o}`/`w1,w2,w3`, CRF transition, `blocks.*` naming).
+
+### Measured: plain PTQ ternary collapses the model → QAT is mandatory
+
+`quant_eval.py` ternarizes every 2D linear weight channel-wise at the same
+contract `export.ternary_channel` uses, then re-runs the exact `v4_eval`
+intent/slot harness on the V5 model.
+
+| config | intent (MOVE subset) | person value |
+|---|---|---|
+| fp (validation) | 59.3% | 39.8% |
+| ternary ramp=1.0 | **0%** | 13.8% |
+| ternary ramp=0.5 | **0%** | 10.5% |
+
+`--fp` reproduces `v4_eval` (loader verified), so the 0% is a genuine
+collapse: the fp-trained V5 weights are not ternarizable without retraining.
+**There is no PTQ shortcut — full QAT retraining is required.**
+
+### QAT plan (QAT support in the V4/V5 path, currently absent)
+
+`v4_model.py`/`v4_train.py` are pure-fp; the QAT ramp (`ternary_ste`,
+`--fp/--t`) exists only in `train_student.py`/`model.py` for the old
+generative model. Design:
+
+1. Add a `--t <ramp>` flag to `v4_train.py` that replaces each linear
+   weight with `ternary_ste(w, t)` (straight-through: forward uses the
+   ternary approx, backward passes the fp gradient) — fused as `x @
+   ternary_ste(w,t).T` in `Attention`/`FFN`/`intent_head`/`slot_head`.
+2. Anneal `t` 0.0 → 1.0 over the run (freeze last few epochs at 1.0) so
+   weights settle into ternarizable values; keep embedding fp, norms fp.
+3. Validate the QAT checkpoint with `quant_eval.py --ramp 1.0` plus the fp
+   `v4_eval.py` — **budget target: intent within ~2 points of fp, span F1
+   within ~0.02** (measured per the conversation's acceptance bar).
+4. Write a small `export_v4.py` (or extend `export.py`) that maps `V4Model`
+   tensors to the existing blob: ternarized linears via `ternary_channel`,
+   embedding int8, norms/biases fp16, and the CRF `trans`/`log_mask`/start-
+   forbid collapsed into an exported `crf` struct (additive 9×9 fp16 + a
+   `SLOT_LABELS` family table so Viterbi runs on device).
+5. Round-trip test: unpack via `unpack_trits`/`int8_rows` reference and
+   re-run `quant_eval` to confirm the packed number matches the QAT-checkpoint
+   score.
+
+`quant_eval.py` (new, committed) is the harness for steps 1-3.
+
+---
+
 
 
 ## V4 branch — joint intent + slot-tagger pivot (atomic commands)
